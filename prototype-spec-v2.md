@@ -1,4 +1,7 @@
-# FOSS Repo Proxy Prototype — Design v2
+# `tulli` — FOSS Repo Proxy Prototype — Design v2
+
+> **Name:** `tulli` (Finnish, *customs*) — a customs house for incoming
+> open-source code. Module path `codeberg.org/qwc/tulli`. See `IMPLEMENTATION.md`.
 
 > **Status.** This document is the result of a design discussion that revises
 > the original `prototype-spec.md` (referred to below as **v1**). It changes
@@ -92,7 +95,9 @@ Two doors, one hallway.
 
 - Bare mirrors on disk, path mirrors the URL 1:1:
   `${DATA}/mirrors/github.com/<owner>/<repo>.git`
-- Created via `git clone --mirror <upstream>` on first request. **The first
+- Created via `git clone --mirror <upstream>` on first request —
+  **anonymously** (upstreams are public FOSS; private repos are out of scope, so
+  there are **no upstream credentials** and no credential store). **The first
   fetch blocks while this clone runs** — for a large upstream (kernel-scale)
   that can be minutes, and the client's `git` just waits. This is an **accepted
   shortcut for the prototype** (§11.2); the async "mirroring, retry shortly"
@@ -214,7 +219,10 @@ aliases or shortens URLs, this breaks. Don't allow it.
 
 ## 5. Identity & self-service
 
-Identity is first-class in v2 (v1 punted). Minimum:
+Identity is first-class in v2 (v1 punted). This is **downstream** identity —
+*our* users (CI / devs) pulling *through* the proxy, for audit + precise notify.
+It is unrelated to upstream: upstreams are public FOSS fetched anonymously
+(§2.1), so there are no upstream credentials to manage. Minimum:
 
 - `users`, `ssh_keys` (fingerprint → user), `tokens` (hashed, for HTTPS).
 - **Self-service web frontend:** session login → paste public key → we compute
@@ -287,6 +295,84 @@ Blocking a bad commit reachable from a *clean* ref means rejecting specific
 stream, i.e. **Strategy B**. This is the *second* reason to graduate off
 `http-backend` (the first being success-messages). Adopt B once, get both.
 Not built now; just not precluded.
+
+### 6.6 Who writes a QUARANTINED row: auto vs. human-in-the-loop
+
+Not every finding should auto-quarantine. Scanners sit at different points on a
+*decision-confidence* axis, and that — not severity — decides who actuates the
+verdict:
+
+- **Secrets (gitleaks HIGH)** are deterministic and low-false-positive — a live
+  AWS key is a live AWS key. These **auto-quarantine** the ref (§7).
+- **CVEs (Trivy / any vuln scanner)** are the *normal state of every FOSS repo*.
+  A HIGH CVE in a transitive dependency is routine; auto-quarantining on it
+  would block nearly every clone the proxy ever serves — it would break the
+  whole value proposition. CVE findings therefore **do not auto-quarantine**.
+- **Malicious-code heuristics (§8.7)** are the highest-FP of all and likewise
+  **never auto-block**.
+
+**The review queue (triage webview).** CVE and malicious-code findings for the
+mirrored repos land in a web surface where itsec / the responsible owners see:
+finding + severity + affected component + **blast radius** (who pulled the
+affected ref, from `access_events`) + current verdict. From there a reviewer
+**decides**: quarantine (repo-wide or this ref), accept-risk/dismiss (→ an
+override, modelled as VEX, §8.6), or request re-scan. The human's decision is
+what writes the `QUARANTINED` / `OVERRIDDEN` verdict row; the resolver (§6.3) is
+unchanged — only *what actuates it* differs (deterministic policy for secrets, a
+person for everything else).
+
+**CISA KEV** (known-exploited) and **EPSS** (exploit probability) are **triage
+aids**, not auto-actions: they sort and pre-flag the queue so "KEV — block this"
+floats to the top. Policy-based auto-quarantine ("auto-block anything in KEV")
+is a **deferred** accelerator — unblocked by this model, not built now.
+
+This is the operational home of thesis 4: continuous monitoring surfaces risk;
+humans adjudicate the ambiguous cases; only the unambiguous (secrets) is
+automatic.
+
+### 6.7 Lifting a block: what persists, what waives
+
+One principle: **a block persists until its specific cause is provably gone, or a
+human explicitly waives it.** New commits alone never clear it. *How* it clears
+depends on the finding's attribution (§8.6) and on who decided the block.
+
+**Secrets (Commit-attributed) — reachability, auto.** A secret is a *blob in
+history*: it is retrieved on every clone as long as the introducing commit is
+**reachable** from the tip, *even if a later commit deletes the file* — delete ≠
+rewrite; the blob stays in fetchable history (this is why leaked secrets must be
+rotated, not just deleted). So a new tip stays blocked while any triggering
+commit is reachable (`git merge-base --is-ancestor C tip`). Only a history
+rewrite / force-push that drops all triggering commits lifts it — the tip then
+reverts to fresh PENDING + re-scan (fail-open-once). (On-update gitleaks over
+`old..new` still runs regardless, to catch *new* secrets in the new commits.)
+
+**CVE / in-tree malicious (TreeState/Component-attributed) — re-scan, human.**
+These are about *what the tip's tree contains*, not history. A later commit that
+bumps the dependency or deletes the malicious file makes the tip clean **even
+though the introducing commit is still reachable** — so the lift test is a
+**re-scan/re-match of the new tip**, not reachability. Because a human made these
+blocks (§6.6), a clean re-scan does not auto-serve; it **returns the item to the
+triage queue** annotated "new tip; blocking CVE-X now absent" for a one-click
+lift. Human stays in the loop.
+
+**Manual waiver (override, §9) — the blocking set.** Independently, a block can
+be waived. Frame the gate as a **blocking set**: ref R is blocked iff there
+exists a HIGH finding on R that is (a) still applicable at the tip (per the tests
+above) and (b) not covered by an active override. Overriding a fingerprint
+removes it from the set; when the set empties, R serves.
+- Override scope is `(repo, ref?, fingerprint)`; `ref = NULL` waives repo-wide
+  (VEX `false_positive`), a ref-scoped waiver maps to VEX `accepted` (§8.6).
+- **Keep the gate O(1):** inserting an override (or recording a clean re-scan)
+  triggers a **verdict recompute** for the affected refs; if the blocking set
+  empties, write a fresh `CLEAN`/`OVERRIDDEN` verdict row that the
+  most-specific-wins resolver (§6.3) then simply reads.
+- **Guardrail:** a fingerprint override composes only against *finding-derived*
+  quarantines. A manual repo-wide "this whole thing is toxic" quarantine
+  (`ref IS NULL`) is lifted only by a manual un-quarantine — one trivial waiver
+  must not punch through a deliberate blanket block.
+
+Two lift paths, one resolver: fingerprint-override (secrets; auto-recompute) and
+triage-decision (CVE/malicious; human `ACCEPTED`/`DISMISSED`).
 
 ---
 
@@ -448,6 +534,145 @@ Descriptor/lane/scope machinery is built so an external adapter (Black Duck et
 al.) slots in later without touching the core. **Do not** implement any
 external scanner now — just don't preclude it.
 
+### 8.5 CVE findings are a *join*, and the join is what drifts — not the tree
+
+The gitleaks/Trivy split (§8.1) recurs *inside* the CVE domain. A CVE finding is:
+
+```
+SBOM (packages@versions this tree contains)   ⋈   vuln DB (what's known-bad today)
+   immutable per tree-state — like history              drifts daily — like Trivy
+```
+
+Store the **two operands separately** and the on-timer job (§8.2) stops being a
+repo re-scan and becomes a **re-join of stored SBOMs against today's
+vulnerability records** — no git operation, no worktree, no walking the tree:
+
+- **SBOM per tip** is generated *on-update* (when the tree changes), immutable
+  thereafter, exactly like gitleaks history. Trivy emits it directly
+  (`--format cyclonedx`).
+- **Vulnerability records** are ingested/refreshed on their own cadence.
+- **On timer:** re-match stored SBOMs ⋈ refreshed vuln records. The *diff* of
+  that re-match is precisely the interval-notification payload — "CVE-2024-X is
+  new today; it hits `openssl@3.0.1`, present in `repo/ref@tip`, pulled by these
+  users." That is how we "notify at intervals without re-scanning."
+
+**Prototype scope:** build the **data-model split** (SBOM stored separately from
+vuln matches) now, so re-match-without-re-scan is not precluded. The re-join
+*optimization* itself may be **deferred** — the prototype can re-run `trivy fs`
+(§8.2 as written) and still populate the split tables. Lock the seam, defer the
+speedup.
+
+### 8.6 Vulnerability model & the standards to normalize on
+
+There is no single "CVE format"; there are four layers, and conflating them is
+why tool outputs look incompatible:
+
+| Layer | Names… | Standards | We use |
+|---|---|---|---|
+| **Definition** | the vuln in the abstract | CVE JSON 5.x (canonical), NVD JSON (CVSS+CPE), **OSV** (FOSS, version-range/ecosystem) | **OSV** |
+| **Identity** | the affected package | CPE (NVD, string-matchy) vs **PURL** (`pkg:npm/foo@1.2.3`) | **PURL** |
+| **Severity** | how bad | **CVSS** vector+score (v3.1/v4.0); KEV/EPSS for exploitability | **CVSS vector** (store the string) |
+| **Finding / interchange** | tool X saw vuln Y here | SARIF (generic), CycloneDX/SPDX (SBOM+vuln), **VEX** (applicability) | internal tables; *emit* CycloneDX/SARIF later |
+
+- **OSV + PURL + CVSS is the normalization target.** Modern OSS scanners
+  (Trivy, grype, osv-scanner) speak OSV/CycloneDX/SARIF natively, so this covers
+  the most ground with the least loss. Each scanner maps its own severity into
+  our `LOW/MEDIUM/HIGH` (§8.4); we keep the raw CVSS vector too.
+- **Not every advisory is a CVE.** Black Duck emits **BDSA** (often *ahead* of
+  NVD), GitHub **GHSA**, Rust **RUSTSEC**, malicious packages **MAL-** (§8.7).
+  So the vuln table is keyed on a generic `(source, id)` with an **aliases**
+  list cross-linking to CVE when known — OSV's own `aliases` design. Black Duck
+  normalizes in without forcing a CVE that may not exist yet.
+- **Overrides = VEX.** CVE suppression ("not affected", "false positive",
+  "accepted risk") *is* VEX (OpenVEX / CSAF / CycloneDX-VEX). Modelling the
+  `overrides` table (§9) as VEX unblocks importing upstream projects' VEX and
+  exporting ours; Trivy consumes VEX natively (`--vex`). Adopt the VEX *shape*
+  now; import/export is **deferred**.
+- **Attribution gains a third mode.** `Descriptor.Attribution` (§8.4) becomes
+  `Commit | TreeState | Component` — a CVE finding attributes to a
+  `purl@version`, not a commit or a whole tree.
+
+### 8.7 Supply-chain / malicious code — a third category
+
+A supply-chain attack (xz-utils, event-stream, SolarWinds) is usually **not a
+CVE**: it's deliberately-introduced malicious code, a typosquat, a poisoned
+install script, an obfuscated payload. Two sub-cases, handled very differently:
+
+- **Known-malicious — already standardized, reuse the OSV pipeline.** Discovered
+  malicious packages are published *in OSV format* with **`MAL-` IDs** (OpenSSF
+  `ossf/malicious-packages`; GitHub Advisory DB "malware" category; osv.dev).
+  These flow through §8.6 unchanged — just another advisory source
+  (`kind = MALWARE`), linked via aliases. Zero new model. This is the one
+  category that *could* auto-quarantine; default is still route-to-review (§6.6).
+
+- **Novel / unknown malicious code — a *detection* problem, not a lookup.** No
+  definition to match and **no single standard format** for the signal, because
+  detection is heuristic. What exists:
+  - *Detection tools* emitting their own findings (SARIF-ish): OpenSSF
+    **Package Analysis** (install sandbox, watches syscalls/network),
+    **GuardDog**, **Socket**, **Semgrep** rules, OSSGadget.
+  - *Provenance / integrity* standards on the **prevention** side: **SLSA**
+    (build provenance), **in-toto** attestations, **Sigstore** (signing +
+    transparency log), **signed commits**.
+
+  **Our structural advantage:** we mirror and **diff every update**, so
+  change-based signals are free and ahead of any external tool — a new
+  `postinstall`/install script, a binary blob added under a source path (xz's
+  payload hid in test fixtures), a committer/maintainer identity change, an
+  obfuscated/high-entropy blob added. Supply-chain attacks trip on the *delta*,
+  and the delta is exactly what the proxy sees.
+
+  Because these detectors run against the **mirrored repo directly** (bare path
+  or a checked-out worktree) and emit findings that land in the *same* store and
+  triage queue, the novel case reduces to **one generic seam**: a Deep-lane
+  `Scanner` (attribution `Commit`/diff or `Component`, on-update trigger,
+  `ScanScope.Worktree` for tools that need a tree) whose results flow into
+  `vuln_matches`/`triage` (§6.6) → always human review, never auto-block.
+
+**Scope — this is the extension, deferred on purpose.** In-house heuristic
+supply-chain detection was in the *original* motivation, but it's a layer *on
+top of* the basics — mirror + gate + secrets/CVE + triage must land first. So
+the prototype builds only the **generic "run a detector over the mirror and
+store its results" seam** (already provided by `Scanner`/`Descriptor`/`ScanScope`,
+§8.4) plus the **known-malicious OSV path** (free — it's §8.6). No concrete
+heuristic and no external detector (GuardDog, Socket, Package Analysis) is
+implemented now; provenance verification (SLSA / in-toto / Sigstore /
+signed-commit) is likewise mentioned, not built. Everything slots into the
+existing registry + review queue when the extension is built.
+
+### 8.8 Mirror refresh scheduler (keep mirrors current without a thundering herd)
+
+Mirrors go stale; new commits — and new attacks — only arrive if we fetch. A
+**refresh scheduler** walks every mirrored repo and runs `git remote update`,
+but **spreads the work** — a nightly window with per-repo jitter / rate-limiting
+— so thousands of repos don't stampede upstreams (GitHub *will* rate-limit) or
+spike local IO all at once.
+
+- Refresh is the **trigger** for the on-update pipeline (§8.2): new commits →
+  gitleaks `old..new`; new/changed tips → SBOM regen (§8.5); new refs recorded
+  in `repo_refs`.
+- It is **distinct** from the vuln re-match sweep (§8.5): refresh brings *new
+  code* (needs the network + git); re-match re-checks *unchanged code* against a
+  drifted DB (needs neither the network nor the repo). Two timers, two purposes.
+- **Age-out interacts** with §8.3's sweep age-out: a long-cold repo can drop out
+  of *refresh* too, not just the scan sweep — a fresh pull re-activates it (same
+  reversible mechanism as §8.3). Knob; default TBD.
+- Upstream **rate-limiting** is a real concern at thousands-of-repos scale —
+  even anonymous fetches can hit abuse caps — so be a good citizen: backoff +
+  jitter. No upstream *auth* (repos are public, §2.1). Minimal in the prototype.
+
+**Sweep set & cadence (resolves §11.1).** The two timers are fully decoupled:
+*refresh* runs nightly (jittered per-repo) and triggers on-update scans only for
+tips that moved; *vuln re-match* runs on **advisory ingest** (default daily).
+Because re-match is a DB join, not a repo scan (§8.5), a fresh advisory feed is
+re-matched **immediately** — the old "mark-stale vs. re-sweep on DB update"
+dilemma disappears; there is no match-staleness to track. The set either timer
+touches is **demand-anchored**: distinct `(repo, ref)` from `access_events` with
+last-pull ≥ now − age-out (§8.3) and commit-date ≥ `scan_floor`. Age-out applies
+**uniformly, including `main`** (re-activation is automatic — no safety loss); a
+per-repo **pin** list forces always-sweep for refs an admin wants monitored
+regardless of pull recency.
+
 ---
 
 ## 9. Data model (revised DDL)
@@ -548,7 +773,8 @@ CREATE TABLE overrides (
     id           BIGSERIAL PRIMARY KEY,
     repo_id      BIGINT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
     ref          TEXT,                         -- scope of the override
-    fingerprint  TEXT NOT NULL,                -- override by stable fingerprint
+    fingerprint  TEXT NOT NULL,                -- stable fingerprint (secrets) or vuln source_id
+    vex_status   TEXT,                          -- VEX (§8.6): not_affected | fixed | false_positive | accepted
     reason       TEXT NOT NULL,
     actor        TEXT NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -574,6 +800,61 @@ CREATE TABLE notifications (
     payload_path TEXT NOT NULL,
     sent_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ── Vulnerability model (§8.6): OSV/PURL/CVSS, deduped globally ──
+
+CREATE TABLE vulnerabilities (
+    id           BIGSERIAL PRIMARY KEY,
+    source       TEXT NOT NULL,                -- 'OSV' | 'NVD' | 'GHSA' | 'BDSA' | 'RUSTSEC' | 'MAL'
+    source_id    TEXT NOT NULL,                -- 'CVE-2024-3094' | 'GHSA-xxxx' | 'MAL-2024-1'
+    aliases      TEXT[] NOT NULL DEFAULT '{}', -- OSV-style cross-links: other ids for the same vuln
+    kind         TEXT NOT NULL DEFAULT 'CVE' CHECK (kind IN ('CVE','MALWARE')),
+    cvss_vector  TEXT,                         -- self-describing (v3.1/v4.0); NULL for malware
+    severity     TEXT CHECK (severity IN ('LOW','MEDIUM','HIGH')),  -- normalized
+    summary      TEXT,
+    refs         JSONB,
+    UNIQUE (source, source_id)
+);
+
+-- SBOM per tree-state (§8.5): immutable once written for a tip.
+CREATE TABLE components (
+    id           BIGSERIAL PRIMARY KEY,
+    repo_id      BIGINT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    ref          TEXT,
+    tip_sha      TEXT NOT NULL,
+    purl         TEXT NOT NULL,                -- pkg:type/name@version
+    scan_id      BIGINT REFERENCES scans(id) ON DELETE SET NULL,
+    UNIQUE (repo_id, tip_sha, purl)
+);
+
+-- Finding = component ⋈ vulnerability, observed by a scan (§8.5).
+CREATE TABLE vuln_matches (
+    id             BIGSERIAL PRIMARY KEY,
+    component_id   BIGINT NOT NULL REFERENCES components(id) ON DELETE CASCADE,
+    vuln_id        BIGINT NOT NULL REFERENCES vulnerabilities(id) ON DELETE CASCADE,
+    scan_id        BIGINT REFERENCES scans(id) ON DELETE SET NULL,
+    scanner        TEXT NOT NULL,              -- 'trivy' | 'blackduck' | ...
+    tool_severity  TEXT,                       -- as reported, pre-normalization
+    fixed_version  TEXT,
+    first_seen     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (component_id, vuln_id)
+);
+CREATE INDEX idx_vuln_matches_vuln ON vuln_matches(vuln_id);
+
+-- Triage queue (§6.6): human adjudication for CVE / malicious-code findings.
+CREATE TABLE triage (
+    id           BIGSERIAL PRIMARY KEY,
+    repo_id      BIGINT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    ref          TEXT,
+    match_id     BIGINT REFERENCES vuln_matches(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL DEFAULT 'PENDING'
+                   CHECK (status IN ('PENDING','QUARANTINED','ACCEPTED','DISMISSED')),
+    reviewer     TEXT,
+    decided_at   TIMESTAMPTZ,
+    note         TEXT
+);
+CREATE INDEX idx_triage_status ON triage(status, repo_id);
 ```
 
 ---
@@ -590,8 +871,19 @@ CREATE TABLE notifications (
 - Fail-open-once + retroactive per-ref quarantine + notification stub (JSON
   file, as v1).
 - Scanners: **gitleaks + Trivy only**, two job types (on-update + on-timer),
-  scheduled sweep over all tags + `main`/`master`.
+  demand-anchored sweep set (§8.8): pulled, in-window `(repo, ref)` above the
+  scan floor, age-out uniform + per-repo pin.
 - `insteadOf` / `PREMIRRORS` documented as the fetcher-config seam.
+- **Vulnerability model split** (§8.5/8.6): SBOM (`components`) stored separately
+  from `vuln_matches`; `vulnerabilities` deduped globally, OSV/PURL/CVSS
+  normalization with an aliases model (BDSA/GHSA/RUSTSEC/MAL slot in).
+- **Review queue / triage webview** (§6.6): CVE + malicious-code findings routed
+  to human adjudication with blast-radius; **only secrets auto-quarantine**.
+- **Known-malicious via OSV `MAL-` feed** (§8.7) plus the **generic seam** to run
+  any detector over the mirror and store its results — **no concrete in-house
+  heuristic built now** (that's the deferred extension, §8.7).
+- **Mirror refresh scheduler** (§8.8): jittered nightly `git remote update` over
+  all mirrors, triggering the on-update pipeline.
 
 **Deferred (unblocked, not built):**
 
@@ -603,31 +895,62 @@ CREATE TABLE notifications (
 - Forgejo (or any rich UI) as an *alternate access surface*.
 - OIDC/SSO login; real email/Slack notifications; HA/backup/TLS.
 - Manifest pre-resolution (pre-mirroring west/Yocto sub-repos ahead of demand).
+- **CVE re-match-without-re-scan** optimization (§8.5): store SBOM + re-join
+  against a refreshed vuln DB on a timer. Prototype may just re-run `trivy fs`.
+- **VEX import/export** (§8.6): consume upstream projects' VEX, emit our own.
+  Adopt the shape now.
+- **Policy-based CVE auto-quarantine** (§6.6): KEV/EPSS-driven auto-block as an
+  accelerator over the human review queue.
+- **The whole in-house supply-chain detection layer** (§8.7) — heuristic diff
+  signals (install-script / binary-blob / identity change), external detectors
+  (GuardDog, Socket, OpenSSF Package Analysis), and provenance verification
+  (SLSA / in-toto / Sigstore / signed-commit). All run on the mirror via the
+  generic seam; deferred as the extension on top of the basics.
+- **Emit CycloneDX / SARIF** for external consumers (§8.6).
 
 ---
 
 ## 11. Open questions for the next round
 
-1. **Timer sweep scope & cadence.** The demand-anchored floor (§8.3) bounds
-   *which* refs are in play; the default branch + in-window tags are the sweep
-   floor; the configurable sweep age-out (default 90d since last pull) bounds
-   the *sweep set*. Still open: which *other* live branch tips get swept, how
-   often the sweep runs, and does a Trivy-DB update trigger an immediate
-   re-sweep of in-window tips or just mark them stale?
+1. ~~**Timer sweep scope & cadence.**~~ **RESOLVED (§8.8).** Two decoupled
+   timers: refresh (nightly, jittered) vs. vuln re-match (on advisory ingest,
+   daily). Sweep set = demand-anchored pulled `(repo, ref)`; age-out applied
+   uniformly incl. `main`, plus a per-repo pin knob. Re-match is a cheap DB
+   join, run immediately on ingest — no "mark-stale vs. re-sweep" dilemma, no
+   match-staleness. No enumeration of "all live branch tips" — demand only.
 2. **First-fetch latency.** ~~Accept-and-note, or add a "mirroring, retry"
    response early?~~ **RESOLVED: accept-and-note.** The first fetch blocks
    while the initial `git clone --mirror` runs (see §2.1). Documented as a
    known limitation; the async retry response is deferred. Revisit only if the
    blocking clone turns out to break a real client's timeout in the demo.
-3. **PENDING policy edges.** Fail-open-once is the rule — but for a ref that
-   *has* been quarantined and then a new commit lands, is the new tip
-   fail-open again or inherit the ref's quarantine until re-scanned?
-4. **Override scope.** Override by fingerprint un-quarantines which refs — just
-   the ones where that fingerprint is the *sole* HIGH finding? (Matches v1's
-   intent, now ref-aware.)
+3. ~~**PENDING policy edges.**~~ **RESOLVED (§6.7).** New commits never
+   auto-clear a block; the lift test is attribution-dependent. **Secrets**
+   (blob-in-history) persist while the introducing commit is *reachable* — a
+   delete-without-rewrite does **not** lift them (blob still cloneable); only a
+   history rewrite does. **CVE / in-tree malicious** lift on a **clean re-scan
+   of the new tip** (tree-state, not reachability) — later removal without
+   rewrite *does* clear them — and since human-blocked, this returns the item to
+   the triage queue rather than auto-serving.
+4. ~~**Override scope.**~~ **RESOLVED (§6.7).** Gate framed as a **blocking
+   set**: ref R blocked iff some HIGH finding on R is still applicable *and* not
+   overridden. Overriding a fingerprint drops it from the set; R serves when the
+   set empties (generalizes v1's "sole finding"). Override scope `(repo, ref?,
+   fingerprint)` maps to VEX; override/re-scan triggers a verdict recompute
+   (gate stays O(1)). Guardrail: a fingerprint waiver can't lift a *manual*
+   repo-wide "toxic" quarantine.
 5. **Black Duck (and friends) integration contract.** What does its result
    actually look like, and does the Descriptor/ScanScope shape above survive
    contact with a real async, licensed, API-based scanner?
+6. **Triage workflow.** Who is the "responsible owner" per repo (routing of the
+   review queue)? Notification cadence for the interval re-match diffs (§8.5) —
+   per-finding, digest, threshold-gated?
+7. **Refresh scheduler tuning** (§8.8). Nightly window + jitter shape, upstream
+   rate-limit/backoff strategy at thousands-of-repos scale, and the refresh
+   age-out default for long-cold repos.
+8. **Native diff-heuristic set** (§8.7) — *for when the extension is built.*
+   Which delta signals are worth the false-positive cost in-house (install-script
+   added, binary blob, identity change) vs. delegating entirely to
+   Socket/GuardDog/Package Analysis? Basics land first; this is the extension.
 
 ---
 
