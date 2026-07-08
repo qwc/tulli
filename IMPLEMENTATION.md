@@ -144,9 +144,12 @@ Each stage is a testable vertical slice.
    `git clone` succeeds, cloned tip SHA == origin, full smart-HTTP
    (`GET info/refs` → `POST git-upload-pack`) flows through the Go handler. See
    `spike/stage0/` (`./run.sh` reproduces). Go 1.26 / git 2.54.
-1. **Walking skeleton.** + path resolve + lazy `Mirror.EnsurePresent` →
-   `git clone http://proxy/repos/github.com/owner/repo` works end-to-end. No
-   gate/scan/identity. Proves the hallway spine.
+1. ✅ **DONE (2026-07-08).** Walking skeleton: path resolve (`internal/git`
+   `RepoRef`/`ParseRequest`) + lazy single-flight `Mirror.EnsurePresent` + CGI
+   handoff, wired through `core.Gatekeeper.Admit` and the `httpsrv` door. A real
+   `git clone http://proxy/repos/github.com/octocat/Hello-World` works
+   end-to-end; concurrent first-fetches collapse to one clone; push refused
+   (read-only); unit tests for the path parser. No gate/scan/identity/store yet.
 2. **Postgres + goose + sqlc.** `repos`, `access_events` → audit the clone.
 3. **Gate + block message.** Manually-inserted quarantine verdict → `ERR`
    pkt-line blocks; clean ref still serves. Core of the §12 demo.
@@ -161,12 +164,20 @@ Demoable secret-quarantine flow by stage 4.
 
 ## 6. Testing
 
-- **Unit:** verdict resolver (most-specific-wins + blocking-set recompute, §6.7),
-  path resolve (`RepoRef` parse), `ERR` pkt-line encoding, reachability lift test
-  (`merge-base --is-ancestor`).
-- **Acceptance:** `demo.sh` per spec §12 — clone clean → quarantine dirty ref →
-  blocked clone + clean ref still serves → override → clones again.
-- **Env:** `docker compose up` = proxy + Postgres (spec §12).
+Discipline: pure logic gets table/unit tests; I/O-and-subprocess paths get an
+integration test that drives real `git`. Seams are injectable (`Mirror.cloneFn`,
+`httpsrv.Gate`/`Handoff` interfaces) so units run without git/network.
+
+- **Unit (in place, stage 1):** `internal/git` path resolve + single-flight /
+  cache / retry / context-cancel (injected clone fn); `internal/core` Admit +
+  read-only refusal; `internal/httpsrv` routing + block/error mapping (fakes).
+  `core`/`httpsrv` at 100% stmt coverage; run under `-race`.
+- **Integration (in place, `internal/e2e`):** real git/core/httpsrv stack behind
+  an `httptest` server; actual `git clone` over `file://` (deterministic) and a
+  real GitHub clone (skipped in `-short`).
+- **Future:** verdict resolver (most-specific-wins + blocking-set recompute,
+  §6.7), `ERR` pkt-line encoding, reachability lift (`merge-base --is-ancestor`);
+  `demo.sh` acceptance per spec §12; `docker compose up` = proxy + Postgres.
 
 ---
 
