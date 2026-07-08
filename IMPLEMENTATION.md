@@ -52,9 +52,14 @@ internal/auth        identity: pubkey fingerprint → user, token → user
 internal/gate        verdict resolver (most-specific-wins) + blocking-set recompute
 internal/scan        Scanner registry + in-memory workers (fast lane)
 internal/mirror      refresh scheduler + reconciler (hideRefs = DB desired state)
-internal/store       sqlc-generated queries + thin wrapper
-migrations/          goose .sql files (spec §9 DDL)
+internal/store       core.Store backends: Mem (fast test fake) + pg/ (Postgres, sqlc over pgxpool)
+migrations/          embedded goose .sql (spec §9 DDL)
+vendor/              vendored deps (dev env module cache is read-only)
 ```
+
+Packages tagged for later stages (sshsrv, web, auth, gate, scan; mirror's
+reconciler) are not built yet — the ones present are core, httpsrv, git, store,
+store/pg, migrations.
 
 ---
 
@@ -150,7 +155,16 @@ Each stage is a testable vertical slice.
    `git clone http://proxy/repos/github.com/octocat/Hello-World` works
    end-to-end; concurrent first-fetches collapse to one clone; push refused
    (read-only); unit tests for the path parser. No gate/scan/identity/store yet.
-2. **Postgres + goose + sqlc.** `repos`, `access_events` → audit the clone.
+2. ✅ **DONE (2026-07-08).** Postgres + goose + sqlc. Full §9 schema as an
+   embedded goose migration; `internal/store/pg` (sqlc-generated queries over
+   pgxpool) implements `core.Store`; `repos` upserted on admit, `access_events`
+   recorded on serve (status + bytes + INET source_ip). `main` uses Postgres when
+   `TULLI_DATABASE_URL` is set, else the in-memory store. **Decision (revises the
+   sqlite-local idea):** Postgres-only — embedded-postgres proved runnable in this
+   sandbox, so we keep full PG power (JSONB/arrays/DISTINCT ON) and still test the
+   real schema locally. `internal/store.Mem` stays as the fast unit-test fake.
+   Deps are vendored (read-only module cache). Verified: full §9 DDL applies on
+   real PG; upsert idempotent; audit row persists.
 3. **Gate + block message.** Manually-inserted quarantine verdict → `ERR`
    pkt-line blocks; clean ref still serves. Core of the §12 demo.
 4. **gitleaks worker + fail-open-once + retro-quarantine + reconciler.** Full
@@ -173,8 +187,13 @@ integration test that drives real `git`. Seams are injectable (`Mirror.cloneFn`,
   read-only refusal; `internal/httpsrv` routing + block/error mapping (fakes).
   `core`/`httpsrv` at 100% stmt coverage; run under `-race`.
 - **Integration (in place, `internal/e2e`):** real git/core/httpsrv stack behind
-  an `httptest` server; actual `git clone` over `file://` (deterministic) and a
-  real GitHub clone (skipped in `-short`).
+  an `httptest` server; actual `git clone` over `file://` (deterministic, asserts
+  the audit trail) and a real GitHub clone (skipped in `-short`).
+- **Postgres (in place, `internal/store/pg`):** embedded-postgres boots a real PG,
+  goose applies the full §9 schema, and the store's queries run against it
+  (upsert idempotency, INET audit row). Skipped in `-short`; skipped (not failed)
+  if the PG binary can't be fetched. Needs a writable `$HOME` for its download
+  cache.
 - **Future:** verdict resolver (most-specific-wins + blocking-set recompute,
   §6.7), `ERR` pkt-line encoding, reachability lift (`merge-base --is-ancestor`);
   `demo.sh` acceptance per spec §12; `docker compose up` = proxy + Postgres.

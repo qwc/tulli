@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
+	"codeberg.org/qwc/tulli/internal/store"
+	"codeberg.org/qwc/tulli/internal/store/pg"
 )
 
 func envOr(key, def string) string {
@@ -46,10 +49,28 @@ func main() {
 	}
 
 	mirror := git.NewMirror(mirrorRoot, *upstreamBase, log)
-	gate := core.New(mirror, log)
+
+	// Audit store: Postgres when TULLI_DATABASE_URL is set, else in-memory
+	// (non-persistent). Both satisfy the core.Store seam.
+	var st core.Store
+	storeKind := "mem (non-persistent)"
+	if dsn := envOr("TULLI_DATABASE_URL", ""); dsn != "" {
+		pgs, err := pg.Open(context.Background(), dsn)
+		if err != nil {
+			log.Error("postgres store unavailable", "err", err)
+			os.Exit(1)
+		}
+		defer pgs.Close()
+		st = pgs
+		storeKind = "postgres"
+	} else {
+		st = store.NewMem()
+	}
+
+	gate := core.New(mirror, st, log)
 	srv := httpsrv.New(gate, backend, log)
 
-	log.Info("tulli stage-1 listening", "addr", *addr, "mirrors", mirrorRoot, "upstreamBase", *upstreamBase)
+	log.Info("tulli listening", "addr", *addr, "mirrors", mirrorRoot, "upstreamBase", *upstreamBase, "store", storeKind)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Error("server exited", "err", err)
 		os.Exit(1)

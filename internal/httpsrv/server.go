@@ -1,14 +1,15 @@
 // Package httpsrv is the HTTP door onto the core hallway: it resolves identity
-// (a no-op in stage 1), parses the path, calls the gate, and — when allowed —
-// hands off to git-http-backend. ~one screen of adapter; the policy lives in
-// core. It depends on the Gate/Handoff interfaces (not concrete types) so the
-// routing can be tested with fakes.
+// (a no-op in stage 1), parses the path, calls the gate, hands off to
+// git-http-backend when allowed, and records the fetch. It depends on the
+// Gate/Handoff interfaces (not concrete types) so the routing can be tested with
+// fakes.
 package httpsrv
 
 import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 
 	"codeberg.org/qwc/tulli/internal/core"
@@ -18,7 +19,7 @@ import (
 // Gate is the hallway seam (implemented by *core.Gatekeeper).
 type Gate interface {
 	Admit(ctx context.Context, ref git.RepoRef, verb string) (core.Admission, error)
-	FinishAudit(ctx context.Context, id int64, status int, n int64)
+	FinishAudit(ctx context.Context, a core.Access)
 }
 
 // Handoff serves the bytes for an admitted request (implemented by *git.Backend).
@@ -41,8 +42,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	// All git smart-HTTP traffic; we parse the verb from the path ourselves
-	// rather than registering many patterns.
 	mux.Handle("/repos/", http.HandlerFunc(s.serveRepos))
 	return mux
 }
@@ -52,7 +51,6 @@ func (s *Server) serveRepos(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, git.ErrUnsupported):
-			// Dumb-protocol / unknown endpoint.
 			http.Error(w, "tulli serves the git smart protocol only", http.StatusNotFound)
 		default:
 			http.Error(w, "bad repo path", http.StatusBadRequest)
@@ -78,6 +76,62 @@ func (s *Server) serveRepos(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.log.Info("serve", "ref", ref.String(), "verb", verb, "service", r.URL.Query().Get("service"))
-	s.backend.Serve(w, r, adm.RepoPath, verb)
-	s.gate.FinishAudit(r.Context(), adm.AuditID, http.StatusOK, 0)
+	cw := &countingWriter{ResponseWriter: w}
+	s.backend.Serve(cw, r, adm.RepoPath, verb)
+	s.gate.FinishAudit(r.Context(), core.Access{
+		RepoID:   adm.RepoID,
+		SourceIP: clientIP(r),
+		Status:   cw.status(),
+		Bytes:    cw.n,
+	})
+}
+
+// countingWriter records the response status and byte count for the audit trail
+// while transparently forwarding to the underlying writer (including Flush, so
+// git's streaming response isn't buffered).
+type countingWriter struct {
+	http.ResponseWriter
+	code int
+	n    int64
+}
+
+func (c *countingWriter) WriteHeader(code int) {
+	if c.code == 0 {
+		c.code = code
+	}
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	if c.code == 0 {
+		c.code = http.StatusOK
+	}
+	n, err := c.ResponseWriter.Write(b)
+	c.n += int64(n)
+	return n, err
+}
+
+func (c *countingWriter) Flush() {
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer's optional
+// interfaces (Flusher/Hijacker) through the wrapper.
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+func (c *countingWriter) status() int {
+	if c.code == 0 {
+		return http.StatusOK
+	}
+	return c.code
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }

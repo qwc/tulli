@@ -20,6 +20,7 @@ type fakeGate struct {
 	finishCalls int
 	gotRef      git.RepoRef
 	gotVerb     string
+	gotAccess   core.Access
 }
 
 func (f *fakeGate) Admit(ctx context.Context, ref git.RepoRef, verb string) (core.Admission, error) {
@@ -27,7 +28,10 @@ func (f *fakeGate) Admit(ctx context.Context, ref git.RepoRef, verb string) (cor
 	f.gotRef, f.gotVerb = ref, verb
 	return f.admitFn(ctx, ref, verb)
 }
-func (f *fakeGate) FinishAudit(_ context.Context, _ int64, _ int, _ int64) { f.finishCalls++ }
+func (f *fakeGate) FinishAudit(_ context.Context, a core.Access) {
+	f.finishCalls++
+	f.gotAccess = a
+}
 
 type fakeHandoff struct {
 	called   bool
@@ -56,7 +60,7 @@ func do(srv *Server, method, target string) *httptest.ResponseRecorder {
 
 func allow(path string) func(context.Context, git.RepoRef, string) (core.Admission, error) {
 	return func(_ context.Context, _ git.RepoRef, verb string) (core.Admission, error) {
-		return core.Admission{Allowed: true, RepoPath: path, Verb: verb}, nil
+		return core.Admission{Allowed: true, RepoPath: path, RepoID: 42, Verb: verb}, nil
 	}
 }
 
@@ -83,6 +87,11 @@ func TestServeRepos_AllowedHandsOff(t *testing.T) {
 	}
 	if g.finishCalls != 1 {
 		t.Errorf("FinishAudit calls = %d, want 1", g.finishCalls)
+	}
+	// The audit must capture the served status + byte count (len("SERVED")=6)
+	// and carry the admission's repo id.
+	if g.gotAccess.RepoID != 42 || g.gotAccess.Status != http.StatusOK || g.gotAccess.Bytes != 6 {
+		t.Errorf("audit access = %+v, want {RepoID:42 Status:200 Bytes:6}", g.gotAccess)
 	}
 }
 

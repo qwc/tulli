@@ -19,7 +19,10 @@ Early prototype, built in stages (see `IMPLEMENTATION.md` §5).
 - **Stage 0 ✅** — Strategy A validated (`spike/stage0/`).
 - **Stage 1 ✅** — walking skeleton: single read-only binary that lazily mirrors a
   public upstream on first fetch (single-flighted) and serves it via
-  `git-http-backend`. No gate/scan/identity/store yet.
+  `git-http-backend`.
+- **Stage 2 ✅** — persistence + audit: full §9 schema (goose), Postgres store
+  (`pgx` + `sqlc`) recording `repos` + `access_events`. Postgres when
+  `TULLI_DATABASE_URL` is set, else an in-memory store. No gate/scan/identity yet.
 
 ## Build & run
 
@@ -49,6 +52,7 @@ git clone http://localhost:8080/repos/github.com/octocat/Hello-World
 | `-addr` | `TULLI_ADDR` | `:8080` | listen address |
 | `-data` | `TULLI_DATA` | `./data` | mirrors live in `<data>/mirrors` |
 | `-upstream-base` | `TULLI_UPSTREAM_BASE` | `https://` | upstream base; a bare scheme, or a URL prefix for `file://` test fixtures |
+| — | `TULLI_DATABASE_URL` | (unset) | Postgres DSN for the audit store; unset ⇒ in-memory (non-persistent). Migrations run automatically on start. |
 
 ## Test
 
@@ -64,13 +68,18 @@ go test -short ./...     # skip the network (real GitHub) integration test
 - **Integration (`internal/e2e`):** wires the real git/core/httpsrv stack behind
   an `httptest` server and drives actual `git clone` — over a local `file://`
   upstream (deterministic) and, unless `-short`, a real GitHub clone.
+- **Postgres (`internal/store/pg`):** boots embedded-postgres, applies the schema,
+  and runs the store's queries against a real PG. Skipped in `-short`; needs a
+  writable `$HOME` (download cache) and network on first run.
 
 ## Layout
 
 ```
 cmd/tulli         main; wiring
 internal/git      path resolve, lazy mirror (single-flight), http-backend handoff
-internal/core     the hallway: Gatekeeper (Admit/FinishAudit) + seams
+internal/core     the hallway: Gatekeeper (Admit/FinishAudit) + seams (Mirror/Store)
 internal/httpsrv  HTTP door onto the hallway
+internal/store    core.Store backends: Mem (test fake) + pg/ (Postgres, sqlc)
+migrations/       embedded goose schema (spec §9)
 spike/stage0      throwaway proof of the CGI handoff (reference)
 ```

@@ -19,6 +19,7 @@ import (
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
+	"codeberg.org/qwc/tulli/internal/store"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -49,8 +50,9 @@ func makeUpstream(t *testing.T, dir, seed string) {
 	os.RemoveAll(src)
 }
 
-// newStack wires the real stack and returns the test server + the mirror root.
-func newStack(t *testing.T, upstreamBase string) (*httptest.Server, string) {
+// newStack wires the real stack and returns the test server, mirror root, and
+// the in-memory audit store (for asserting the audit trail).
+func newStack(t *testing.T, upstreamBase string) (*httptest.Server, string, *store.Mem) {
 	t.Helper()
 	backend, err := git.NewBackend()
 	if err != nil {
@@ -58,17 +60,18 @@ func newStack(t *testing.T, upstreamBase string) (*httptest.Server, string) {
 	}
 	mirrors := filepath.Join(t.TempDir(), "mirrors")
 	mirror := git.NewMirror(mirrors, upstreamBase, discardLogger())
-	gate := core.New(mirror, discardLogger())
+	st := store.NewMem()
+	gate := core.New(mirror, st, discardLogger())
 	srv := httpsrv.New(gate, backend, discardLogger())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return ts, mirrors
+	return ts, mirrors, st
 }
 
 func TestE2E_CloneThroughProxy(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "example.com/acme/widget"), "hello e2e\n")
-	ts, mirrors := newStack(t, "file://"+up)
+	ts, mirrors, st := newStack(t, "file://"+up)
 
 	dst := filepath.Join(t.TempDir(), "clone")
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/example.com/acme/widget", dst)
@@ -80,12 +83,31 @@ func TestE2E_CloneThroughProxy(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(mirrors, "example.com/acme/widget.git", "HEAD")); err != nil {
 		t.Errorf("mirror not created on disk: %v", err)
 	}
+
+	// Audit trail: the repo was recorded and at least one served fetch logged
+	// with a real status + byte count.
+	if st.RepoCount() != 1 {
+		t.Errorf("audit RepoCount = %d, want 1", st.RepoCount())
+	}
+	ev := st.Events()
+	if len(ev) == 0 {
+		t.Fatal("no access events recorded")
+	}
+	var served bool
+	for _, e := range ev {
+		if e.Status == 200 && e.Bytes > 0 && e.RepoID != 0 {
+			served = true
+		}
+	}
+	if !served {
+		t.Errorf("expected an access event with status 200 and bytes>0; got %+v", ev)
+	}
 }
 
 func TestE2E_CacheHitSecondClone(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "h/o/r"), "x\n")
-	ts, _ := newStack(t, "file://"+up)
+	ts, _, _ := newStack(t, "file://"+up)
 
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/h/o/r", filepath.Join(t.TempDir(), "a"))
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/h/o/r", filepath.Join(t.TempDir(), "b"))
@@ -94,7 +116,7 @@ func TestE2E_CacheHitSecondClone(t *testing.T) {
 func TestE2E_ConcurrentFirstFetch(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "h/o/con"), "concurrent\n")
-	ts, _ := newStack(t, "file://"+up)
+	ts, _, _ := newStack(t, "file://"+up)
 
 	base := t.TempDir()
 	const N = 4
@@ -122,7 +144,7 @@ func TestE2E_ConcurrentFirstFetch(t *testing.T) {
 func TestE2E_ReadOnlyPushRefused(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "h/o/r"), "x\n")
-	ts, _ := newStack(t, "file://"+up)
+	ts, _, _ := newStack(t, "file://"+up)
 
 	dst := filepath.Join(t.TempDir(), "c")
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/h/o/r", dst)
@@ -141,7 +163,7 @@ func TestE2E_GitHubCloneThroughProxy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping network test in -short")
 	}
-	ts, mirrors := newStack(t, "https://")
+	ts, mirrors, _ := newStack(t, "https://")
 
 	dst := filepath.Join(t.TempDir(), "gh")
 	cmd := exec.CommandContext(context.Background(), "git", "clone", "-q",

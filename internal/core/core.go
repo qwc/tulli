@@ -1,7 +1,7 @@
 // Package core is the transport-agnostic hallway (spec §2): identity → resolve →
 // ensure → gate → serve → audit. Both the HTTP and SSH adapters make one call
-// into it. This is the stage-1 skeleton: resolve + ensure only; gate, identity,
-// and audit arrive in later stages behind these same seams.
+// into it. Stage 2 adds the audit trail via the Store seam; gate/identity still
+// arrive later behind these same seams.
 package core
 
 import (
@@ -11,33 +11,54 @@ import (
 	"codeberg.org/qwc/tulli/internal/git"
 )
 
-// Admission is the hallway's decision. The transport does the actual serve from
-// RepoPath (CGI for HTTP, exec for SSH) when Allowed, then calls FinishAudit.
+// Admission is the hallway's decision. The transport serves from RepoPath (CGI
+// for HTTP, exec for SSH) when Allowed, then reports the outcome via FinishAudit.
 type Admission struct {
 	Allowed  bool
 	RepoPath string // bare mirror path the transport serves from
+	RepoID   int64  // audit handle for the resolved repo (0 = not recorded)
 	Verb     string
 	BlockMsg string // remote: message when !Allowed (spec §3.3)
-	AuditID  int64  // handle to close out after serve (stage 2+)
+}
+
+// Access is one recorded fetch (spec §9 access_events). Ref/commit are left for
+// a later stage — they require reading the upload-pack negotiation, which we
+// don't yet parse.
+type Access struct {
+	RepoID   int64
+	SourceIP string
+	Status   int
+	Bytes    int64
 }
 
 // Mirror is the seam onto lazy mirroring (implemented by internal/git.Mirror).
 type Mirror interface {
 	EnsurePresent(ctx context.Context, ref git.RepoRef) (string, error)
+	UpstreamURL(ref git.RepoRef) string
 }
 
-// Gatekeeper runs the policy pipeline. Stage 1 wires only the mirror; the gate
-// (verdict resolver) and store slot in later without changing this signature.
+// Store is the persistence seam. It is deliberately dialect-agnostic so a local
+// SQLite backend and a production Postgres backend can both satisfy it (see
+// IMPLEMENTATION.md). The consumer (core) defines it; implementations live in
+// internal/store.
+type Store interface {
+	UpsertRepo(ctx context.Context, upstreamURL, mirrorPath string) (int64, error)
+	InsertAccessEvent(ctx context.Context, a Access) error
+}
+
+// Gatekeeper runs the policy pipeline. The gate (verdict resolver) slots in later
+// without changing this signature.
 type Gatekeeper struct {
 	mirror Mirror
+	store  Store
 	log    *slog.Logger
 }
 
-func New(m Mirror, log *slog.Logger) *Gatekeeper {
-	return &Gatekeeper{mirror: m, log: log}
+func New(m Mirror, s Store, log *slog.Logger) *Gatekeeper {
+	return &Gatekeeper{mirror: m, store: s, log: log}
 }
 
-// Admit runs resolve(done by the adapter) → ensure-mirrored → gate → open-audit.
+// Admit runs resolve(done by the adapter) → ensure-mirrored → record-repo → gate.
 func (g *Gatekeeper) Admit(ctx context.Context, ref git.RepoRef, verb string) (Admission, error) {
 	// Read-only invariant (IMPLEMENTATION.md §1): never serve push.
 	if verb == git.VerbReceivePack {
@@ -48,14 +69,29 @@ func (g *Gatekeeper) Admit(ctx context.Context, ref git.RepoRef, verb string) (A
 		}, nil
 	}
 
-	// stage 1: no gate yet — everything that mirrors successfully is allowed.
+	// stage 2: no gate yet — everything that mirrors successfully is allowed.
 	dir, err := g.mirror.EnsurePresent(ctx, ref)
 	if err != nil {
 		return Admission{}, err
 	}
-	return Admission{Allowed: true, RepoPath: dir, Verb: verb}, nil
+
+	// Record/lookup the repo for audit. A store failure must NOT fail the fetch
+	// (availability over audit-completeness); we log and serve without a repo id.
+	repoID, err := g.store.UpsertRepo(ctx, g.mirror.UpstreamURL(ref), dir)
+	if err != nil {
+		g.log.Error("repo upsert failed; serving without audit id", "ref", ref.String(), "err", err)
+		repoID = 0
+	}
+	return Admission{Allowed: true, RepoPath: dir, RepoID: repoID, Verb: verb}, nil
 }
 
-// FinishAudit records the outcome of a served request. No-op until the store
-// lands (stage 2).
-func (g *Gatekeeper) FinishAudit(ctx context.Context, id int64, status int, bytes int64) {}
+// FinishAudit records a served fetch. Best-effort: audit-store errors are logged,
+// never surfaced to the client.
+func (g *Gatekeeper) FinishAudit(ctx context.Context, a Access) {
+	if a.RepoID == 0 {
+		return // repo wasn't recorded; nothing to attribute the event to
+	}
+	if err := g.store.InsertAccessEvent(ctx, a); err != nil {
+		g.log.Error("audit insert failed", "repo_id", a.RepoID, "err", err)
+	}
+}

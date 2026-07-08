@@ -47,6 +47,9 @@ func NewMirror(root, upstreamBase string, log *slog.Logger) *Mirror {
 	}
 }
 
+// UpstreamURL is the upstream this ref mirrors from (for the repo audit record).
+func (m *Mirror) UpstreamURL(ref RepoRef) string { return ref.UpstreamURL(m.upstreamBase) }
+
 // EnsurePresent returns the local bare-mirror path for ref, cloning it first if
 // absent. Safe for concurrent calls; duplicate first-fetches share one clone.
 func (m *Mirror) EnsurePresent(ctx context.Context, ref RepoRef) (string, error) {
