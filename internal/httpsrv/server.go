@@ -71,7 +71,14 @@ func (s *Server) serveRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !adm.Allowed {
-		http.Error(w, adm.BlockMsg, http.StatusForbidden)
+		// A real git client reads the block only as an ERR pkt-line at info/refs
+		// (spec §3.3); a plain 403 there is swallowed as a generic HTTP error. For
+		// the git-upload-pack POST (or a browser) a 403 with the text is right.
+		if verb == git.VerbInfoRefs {
+			git.WriteBlock(w, adm.BlockMsg)
+		} else {
+			http.Error(w, adm.BlockMsg, http.StatusForbidden)
+		}
 		return
 	}
 

@@ -10,6 +10,46 @@ import (
 	"net/netip"
 )
 
+const currentQuarantines = `-- name: CurrentQuarantines :many
+SELECT ref, reason FROM (
+    SELECT DISTINCT ON (repo_id, ref) ref, decision, reason
+    FROM verdicts
+    WHERE repo_id = $1
+    ORDER BY repo_id, ref, decided_at DESC
+) cur
+WHERE decision = 'QUARANTINED'
+`
+
+type CurrentQuarantinesRow struct {
+	Ref    *string
+	Reason *string
+}
+
+// CurrentQuarantines returns the current (most-recent-per-ref) verdicts for a
+// repo that are QUARANTINED — the enforcement inputs for the gate (spec §6.3).
+// A NULL ref is a repo-wide quarantine. The DISTINCT ON picks the latest verdict
+// per ref *before* filtering on decision, so a newer CLEAN correctly clears an
+// older QUARANTINED.
+func (q *Queries) CurrentQuarantines(ctx context.Context, repoID int64) ([]CurrentQuarantinesRow, error) {
+	rows, err := q.db.Query(ctx, currentQuarantines, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CurrentQuarantinesRow
+	for rows.Next() {
+		var i CurrentQuarantinesRow
+		if err := rows.Scan(&i.Ref, &i.Reason); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertAccessEvent = `-- name: InsertAccessEvent :exec
 INSERT INTO access_events (repo_id, source_ip, http_status, bytes)
 VALUES ($1, $4::inet, $2, $3)

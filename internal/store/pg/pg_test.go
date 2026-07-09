@@ -76,3 +76,63 @@ func TestPG_MigrateUpsertAndAudit(t *testing.T) {
 		t.Fatalf("access row = ip:%s bytes:%d status:%d", ip, bytes, status)
 	}
 }
+
+func TestPG_ResolveVerdict(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	id, err := s.UpsertRepo(ctx, "https://github.com/o/verdicts", "/m/v.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No verdicts yet → clean.
+	if v, err := s.ResolveVerdict(ctx, id); err != nil || v.RepoBlocked || len(v.HiddenRefs) != 0 {
+		t.Fatalf("empty verdict = %+v (err %v), want clean", v, err)
+	}
+
+	insertVerdict := func(ref, decision, reason string) {
+		t.Helper()
+		var refArg any
+		if ref != "" {
+			refArg = ref
+		}
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO verdicts (repo_id, ref, decision, reason) VALUES ($1,$2,$3,$4)`,
+			id, refArg, decision, reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Ref-level quarantine on evil; a newer CLEAN must clear an older QUARANTINED
+	// on good (most-recent-per-ref wins, spec §6.3).
+	insertVerdict("refs/heads/evil", "QUARANTINED", "secret")
+	insertVerdict("refs/heads/good", "QUARANTINED", "oops")
+	insertVerdict("refs/heads/good", "CLEAN", "rescanned")
+
+	v, err := s.ResolveVerdict(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.RepoBlocked {
+		t.Errorf("no repo-wide row yet, RepoBlocked should be false: %+v", v)
+	}
+	if len(v.HiddenRefs) != 1 || v.HiddenRefs[0] != "refs/heads/evil" {
+		t.Fatalf("hidden refs = %v, want just refs/heads/evil (good was re-cleaned)", v.HiddenRefs)
+	}
+
+	// A repo-wide QUARANTINED (NULL ref) blocks the whole repo, reason surfaced.
+	insertVerdict("", "QUARANTINED", "toxic repo")
+	v, err = s.ResolveVerdict(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.RepoBlocked || v.Reason != "toxic repo" {
+		t.Fatalf("verdict = %+v, want RepoBlocked with reason 'toxic repo'", v)
+	}
+}

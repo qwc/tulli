@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"codeberg.org/qwc/tulli/internal/core"
@@ -127,19 +128,46 @@ func TestServeRepos_AdmitErrorIsBadGateway(t *testing.T) {
 	}
 }
 
-func TestServeRepos_QuarantinedIsForbiddenWithMessage(t *testing.T) {
+// At info/refs a block must be an ERR pkt-line (200 body), which is the only
+// form a real git client surfaces (spec §3.3) — not a plain 403.
+func TestServeRepos_QuarantinedInfoRefsWritesErrPktLine(t *testing.T) {
 	srv, _, h := newTestServer(func(context.Context, git.RepoRef, string) (core.Admission, error) {
-		return core.Admission{Allowed: false, BlockMsg: "QUARANTINED: secret"}, nil
+		return core.Admission{Allowed: false, BlockMsg: "tulli: repo QUARANTINED — secret"}, nil
 	})
 	rr := do(srv, "GET", "/repos/github.com/o/r/info/refs?service=git-upload-pack")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (git only reads the ERR body on 2xx)", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/x-git-upload-pack-advertisement" {
+		t.Errorf("content-type = %q, want the upload-pack advertisement type", ct)
+	}
+	if h.called {
+		t.Error("blocked request must not hand off")
+	}
+	body := rr.Body.String()
+	// pkt-line: 4 hex length digits, then "ERR <msg>".
+	if len(body) < 8 || !strings.HasPrefix(body[4:], "ERR ") {
+		t.Fatalf("body = %q, want a 4-hex-prefixed ERR pkt-line", body)
+	}
+	if !strings.Contains(body, "QUARANTINED") {
+		t.Errorf("body = %q, want it to carry the block message", body)
+	}
+}
+
+// A blocked git-upload-pack POST (or a browser) gets a plain 403 with the text.
+func TestServeRepos_QuarantinedUploadPackIsForbidden(t *testing.T) {
+	srv, _, h := newTestServer(func(context.Context, git.RepoRef, string) (core.Admission, error) {
+		return core.Admission{Allowed: false, BlockMsg: "tulli: repo QUARANTINED"}, nil
+	})
+	rr := do(srv, "POST", "/repos/github.com/o/r/git-upload-pack")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rr.Code)
 	}
 	if h.called {
 		t.Error("blocked request must not hand off")
 	}
-	if body := rr.Body.String(); body == "" || body[:12] != "QUARANTINED:" {
-		t.Errorf("body = %q, want the block message", body)
+	if !strings.Contains(rr.Body.String(), "QUARANTINED") {
+		t.Errorf("body = %q, want the block message", rr.Body.String())
 	}
 }
 

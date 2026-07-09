@@ -15,9 +15,12 @@ import (
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 type fakeMirror struct {
-	dir   string
-	err   error
-	calls int32
+	dir       string
+	err       error
+	calls     int32
+	hidden    []string // last refs passed to SetHiddenRefs
+	hideCalls int32
+	hideErr   error
 }
 
 func (f *fakeMirror) EnsurePresent(_ context.Context, _ git.RepoRef) (string, error) {
@@ -25,6 +28,11 @@ func (f *fakeMirror) EnsurePresent(_ context.Context, _ git.RepoRef) (string, er
 	return f.dir, f.err
 }
 func (f *fakeMirror) UpstreamURL(ref git.RepoRef) string { return "https://" + ref.String() }
+func (f *fakeMirror) SetHiddenRefs(_ context.Context, _ string, refs []string) error {
+	atomic.AddInt32(&f.hideCalls, 1)
+	f.hidden = refs
+	return f.hideErr
+}
 
 type fakeStore struct {
 	repoID   int64
@@ -33,6 +41,8 @@ type fakeStore struct {
 	upstream string
 	events   []Access
 	insErr   error
+	verdict  Verdict
+	verdErr  error
 }
 
 func (f *fakeStore) UpsertRepo(_ context.Context, upstreamURL, _ string) (int64, error) {
@@ -43,6 +53,9 @@ func (f *fakeStore) UpsertRepo(_ context.Context, upstreamURL, _ string) (int64,
 func (f *fakeStore) InsertAccessEvent(_ context.Context, a Access) error {
 	f.events = append(f.events, a)
 	return f.insErr
+}
+func (f *fakeStore) ResolveVerdict(_ context.Context, _ int64) (Verdict, error) {
+	return f.verdict, f.verdErr
 }
 
 func TestAdmit_UploadPackAllowedAndRecordsRepo(t *testing.T) {
@@ -107,6 +120,96 @@ func TestAdmit_StoreErrorStillServes(t *testing.T) {
 	}
 	if adm.RepoID != 0 {
 		t.Errorf("RepoID = %d, want 0 when the store failed", adm.RepoID)
+	}
+}
+
+func TestAdmit_RepoWideQuarantineBlocks(t *testing.T) {
+	fm := &fakeMirror{dir: "/m/x.git"}
+	fs := &fakeStore{repoID: 7, verdict: Verdict{RepoBlocked: true, Reason: "3 HIGH secrets (gitleaks)"}}
+	g := New(fm, fs, discardLogger())
+
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adm.Allowed {
+		t.Fatal("repo-wide QUARANTINED must block")
+	}
+	if !strings.Contains(adm.BlockMsg, "QUARANTINED") || !strings.Contains(adm.BlockMsg, "3 HIGH secrets") {
+		t.Errorf("BlockMsg = %q, want it to mention QUARANTINED and the reason", adm.BlockMsg)
+	}
+	if adm.RepoID != 7 {
+		t.Errorf("RepoID = %d, want 7 (block still attributed for audit)", adm.RepoID)
+	}
+	if fm.hideCalls != 0 {
+		t.Errorf("a repo-wide block should not touch hideRefs (got %d calls)", fm.hideCalls)
+	}
+}
+
+func TestAdmit_RefLevelQuarantineHidesAndServes(t *testing.T) {
+	fm := &fakeMirror{dir: "/m/x.git"}
+	fs := &fakeStore{repoID: 7, verdict: Verdict{HiddenRefs: []string{"refs/heads/evil", "refs/tags/bad"}}}
+	g := New(fm, fs, discardLogger())
+
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !adm.Allowed || adm.RepoPath != fm.dir {
+		t.Fatalf("ref-level quarantine should still serve the repo: %+v", adm)
+	}
+	if fm.hideCalls != 1 {
+		t.Fatalf("SetHiddenRefs calls = %d, want 1", fm.hideCalls)
+	}
+	if len(fm.hidden) != 2 || fm.hidden[0] != "refs/heads/evil" || fm.hidden[1] != "refs/tags/bad" {
+		t.Errorf("hidden refs = %v, want the two quarantined refs", fm.hidden)
+	}
+}
+
+// If we cannot hide a known-bad ref, serving would leak it — fail closed.
+func TestAdmit_HideRefsFailureFailsClosed(t *testing.T) {
+	fm := &fakeMirror{dir: "/m/x.git", hideErr: errors.New("git config broke")}
+	fs := &fakeStore{repoID: 7, verdict: Verdict{HiddenRefs: []string{"refs/heads/evil"}}}
+	g := New(fm, fs, discardLogger())
+
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adm.Allowed {
+		t.Fatal("a hideRefs reconcile failure must block, not leak the ref")
+	}
+}
+
+// A transient verdict-query failure fails open (availability) — logged, serves.
+func TestAdmit_VerdictErrorFailsOpen(t *testing.T) {
+	fm := &fakeMirror{dir: "/m/x.git"}
+	fs := &fakeStore{repoID: 7, verdErr: errors.New("db hiccup")}
+	g := New(fm, fs, discardLogger())
+
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	if err != nil {
+		t.Fatalf("verdict error must not fail admit: %v", err)
+	}
+	if !adm.Allowed {
+		t.Fatal("verdict-query failure should fail open (serve), not block")
+	}
+}
+
+func TestAdmit_CleanServesWithoutHiding(t *testing.T) {
+	fm := &fakeMirror{dir: "/m/x.git"}
+	fs := &fakeStore{repoID: 7} // zero-value Verdict = clean
+	g := New(fm, fs, discardLogger())
+
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !adm.Allowed {
+		t.Fatal("a clean repo must serve")
+	}
+	if fm.hideCalls != 0 {
+		t.Errorf("clean repo should not reconcile hideRefs (got %d)", fm.hideCalls)
 	}
 }
 

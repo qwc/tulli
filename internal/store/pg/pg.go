@@ -64,6 +64,28 @@ func (s *Store) UpsertRepo(ctx context.Context, upstreamURL, mirrorPath string) 
 	return s.q.UpsertRepo(ctx, sqlc.UpsertRepoParams{UpstreamUrl: upstreamURL, MirrorPath: mirrorPath})
 }
 
+// ResolveVerdict applies the most-specific-wins resolver (spec §6.3): a current
+// repo-wide (NULL ref) QUARANTINED blocks the whole repo; each current per-ref
+// QUARANTINED is a hidden ref.
+func (s *Store) ResolveVerdict(ctx context.Context, repoID int64) (core.Verdict, error) {
+	rows, err := s.q.CurrentQuarantines(ctx, repoID)
+	if err != nil {
+		return core.Verdict{}, err
+	}
+	var v core.Verdict
+	for _, r := range rows {
+		if r.Ref == nil { // NULL ref = repo-wide quarantine
+			v.RepoBlocked = true
+			if r.Reason != nil {
+				v.Reason = *r.Reason
+			}
+			continue
+		}
+		v.HiddenRefs = append(v.HiddenRefs, *r.Ref)
+	}
+	return v, nil
+}
+
 func (s *Store) InsertAccessEvent(ctx context.Context, a core.Access) error {
 	p := sqlc.InsertAccessEventParams{}
 	if a.RepoID != 0 {

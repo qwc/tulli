@@ -50,6 +50,12 @@ func NewMirror(root, upstreamBase string, log *slog.Logger) *Mirror {
 // UpstreamURL is the upstream this ref mirrors from (for the repo audit record).
 func (m *Mirror) UpstreamURL(ref RepoRef) string { return ref.UpstreamURL(m.upstreamBase) }
 
+// SetHiddenRefs reconciles the mirror's ref-level quarantine (spec §6.4) by
+// making its uploadpack.hideRefs set match refs exactly. See SetHiddenRefs.
+func (m *Mirror) SetHiddenRefs(ctx context.Context, repoPath string, refs []string) error {
+	return SetHiddenRefs(ctx, repoPath, refs)
+}
+
 // EnsurePresent returns the local bare-mirror path for ref, cloning it first if
 // absent. Safe for concurrent calls; duplicate first-fetches share one clone.
 func (m *Mirror) EnsurePresent(ctx context.Context, ref RepoRef) (string, error) {

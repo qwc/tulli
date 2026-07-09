@@ -1,8 +1,9 @@
 // Command tulli is the FOSS repo proxy (see prototype-spec-v2.md,
-// IMPLEMENTATION.md). Stage 1: a single read-only binary that lazily mirrors a
-// public upstream on first fetch and serves it via git-http-backend. No gate,
-// scan, identity, or store yet — those land in later stages behind the same
-// seams.
+// IMPLEMENTATION.md). A single read-only binary that lazily mirrors a public
+// upstream on first fetch, gates it against the verdict store (repo-wide block
+// via ERR pkt-line, ref-level via uploadpack.hideRefs — spec §6), serves it via
+// git-http-backend, and records the fetch. Scanning that writes the verdicts,
+// plus identity, land in later stages behind the same seams.
 package main
 
 import (

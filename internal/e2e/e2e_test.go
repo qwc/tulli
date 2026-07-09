@@ -50,6 +50,21 @@ func makeUpstream(t *testing.T, dir, seed string) {
 	os.RemoveAll(src)
 }
 
+// makeUpstreamBranch adds a branch carrying its own commit to the bare upstream
+// at dir (built by makeUpstream). Used to exercise ref-level quarantine.
+func makeUpstreamBranch(t *testing.T, dir, branch, seed string) {
+	t.Helper()
+	work := t.TempDir()
+	run(t, "", "git", "clone", "-q", dir, work)
+	run(t, work, "git", "checkout", "-q", "-b", branch)
+	if err := os.WriteFile(filepath.Join(work, "EVIL.md"), []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, work, "git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+	run(t, work, "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", seed)
+	run(t, work, "git", "push", "-q", "origin", branch)
+}
+
 // newStack wires the real stack and returns the test server, mirror root, and
 // the in-memory audit store (for asserting the audit trail).
 func newStack(t *testing.T, upstreamBase string) (*httptest.Server, string, *store.Mem) {
@@ -157,6 +172,88 @@ func TestE2E_ReadOnlyPushRefused(t *testing.T) {
 	if !strings.Contains(string(out), "403") && !strings.Contains(strings.ToLower(string(out)), "forbidden") {
 		t.Fatalf("push failed but not with 403/forbidden:\n%s", out)
 	}
+}
+
+// A repo-wide QUARANTINED verdict must abort the clone with our operator
+// message (ERR pkt-line at info/refs, spec §3.3/§6.3) — while a clean repo of
+// the same stack keeps cloning.
+func TestE2E_RepoWideQuarantineBlocksClone(t *testing.T) {
+	up := t.TempDir()
+	makeUpstream(t, filepath.Join(up, "example.com/acme/widget"), "hello\n")
+	ts, _, st := newStack(t, "file://"+up)
+	base := "file://" + up
+
+	// First clone succeeds and registers the repo (assigning its id).
+	run(t, "", "git", "clone", "-q", ts.URL+"/repos/example.com/acme/widget", filepath.Join(t.TempDir(), "before"))
+
+	ref := git.RepoRef{Host: "example.com", Path: "acme/widget"}
+	id, ok := st.RepoID(ref.UpstreamURL(base))
+	if !ok {
+		t.Fatal("repo not registered after first clone")
+	}
+	// Scanner/human retro-quarantines the whole repo.
+	st.SetVerdict(id, "", "QUARANTINED", "3 HIGH secrets (gitleaks)")
+
+	// A subsequent clone must now fail with our message.
+	cmd := exec.Command("git", "clone", "-q", ts.URL+"/repos/example.com/acme/widget", filepath.Join(t.TempDir(), "after"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("clone of a quarantined repo should fail; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "QUARANTINED") || !strings.Contains(string(out), "gitleaks") {
+		t.Fatalf("clone failed but without our block message:\n%s", out)
+	}
+}
+
+// A ref-level QUARANTINED verdict must hide exactly that ref from the
+// advertisement (uploadpack.hideRefs, spec §6.4) while the rest of the repo
+// stays cloneable.
+func TestE2E_RefLevelQuarantineHidesRef(t *testing.T) {
+	up := t.TempDir()
+	repo := filepath.Join(up, "example.com/acme/widget")
+	makeUpstream(t, repo, "clean main\n")
+	makeUpstreamBranch(t, repo, "evil", "leaked secret\n")
+	ts, _, st := newStack(t, "file://"+up)
+	base := "file://" + up
+	url := ts.URL + "/repos/example.com/acme/widget"
+
+	// Before quarantine both refs are advertised (this also registers the repo).
+	if refs := lsRemote(t, url); !refs["refs/heads/main"] || !refs["refs/heads/evil"] {
+		t.Fatalf("expected both branches advertised, got %v", refs)
+	}
+
+	ref := git.RepoRef{Host: "example.com", Path: "acme/widget"}
+	id, ok := st.RepoID(ref.UpstreamURL(base))
+	if !ok {
+		t.Fatal("repo not registered")
+	}
+	st.SetVerdict(id, "refs/heads/evil", "QUARANTINED", "secret on this branch")
+
+	// After quarantine, evil is hidden; main still advertised and cloneable.
+	refs := lsRemote(t, url)
+	if refs["refs/heads/evil"] {
+		t.Errorf("quarantined ref refs/heads/evil must not be advertised; got %v", refs)
+	}
+	if !refs["refs/heads/main"] {
+		t.Errorf("clean ref refs/heads/main must stay advertised; got %v", refs)
+	}
+	run(t, "", "git", "clone", "-q", url, filepath.Join(t.TempDir(), "c"))
+}
+
+// lsRemote returns the set of refs the proxy advertises for url.
+func lsRemote(t *testing.T, url string) map[string]bool {
+	t.Helper()
+	out, err := exec.Command("git", "ls-remote", url).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git ls-remote %s: %v\n%s", url, err, out)
+	}
+	refs := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if f := strings.Fields(line); len(f) == 2 {
+			refs[f[1]] = true
+		}
+	}
+	return refs
 }
 
 func TestE2E_GitHubCloneThroughProxy(t *testing.T) {
