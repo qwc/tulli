@@ -5,11 +5,32 @@ ON CONFLICT (upstream_url) DO UPDATE SET mirror_path = EXCLUDED.mirror_path
 RETURNING id;
 
 -- name: InsertAccessEvent :exec
-INSERT INTO access_events (repo_id, source_ip, http_status, bytes)
-VALUES ($1, sqlc.narg('source_ip')::inet, $2, $3);
+INSERT INTO access_events (repo_id, user_id, source_ip, http_status, bytes)
+VALUES ($1, sqlc.narg('user_id'), sqlc.narg('source_ip')::inet, $2, $3);
 
 -- name: ListRepos :many
 SELECT id, mirror_path FROM repos;
+
+-- Stage 6a: identity & access (auth.Store).
+
+-- name: InsertUser :one
+INSERT INTO users (name, role, kind) VALUES ($1, $2, $3) RETURNING id;
+
+-- name: InsertSSHKey :exec
+INSERT INTO ssh_keys (user_id, fingerprint, pubkey) VALUES ($1, $2, $3);
+
+-- name: InsertToken :exec
+INSERT INTO tokens (user_id, token_hash) VALUES ($1, $2);
+
+-- name: UserByFingerprint :one
+SELECT u.id, u.name, u.role, u.kind
+FROM ssh_keys k JOIN users u ON u.id = k.user_id
+WHERE k.fingerprint = $1;
+
+-- name: UserByTokenHash :one
+SELECT u.id, u.name, u.role, u.kind
+FROM tokens t JOIN users u ON u.id = t.user_id
+WHERE t.token_hash = $1;
 
 -- name: InsertScan :one
 INSERT INTO scans (repo_id, scanner, scope_kind, scope_expr, status, finished_at)

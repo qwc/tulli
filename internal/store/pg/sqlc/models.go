@@ -144,6 +144,8 @@ type User struct {
 	ID        int64
 	Name      string
 	CreatedAt pgtype.Timestamptz
+	Role      string
+	Kind      string
 }
 
 type Verdict struct {

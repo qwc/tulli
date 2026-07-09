@@ -12,6 +12,7 @@ import (
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
@@ -76,7 +77,7 @@ func TestE2E_RealStack_PGAndGitleaks(t *testing.T) {
 	go reconciler.Run(ctx, 500*time.Millisecond) // periodic safety sweep, like main.go
 
 	gate := core.New(mir, st, worker, discardLogger())
-	ts := httptest.NewServer(httpsrv.New(gate, backend, discardLogger()).Handler())
+	ts := httptest.NewServer(httpsrv.New(gate, auth.NewDBProvider(st), backend, discardLogger()).Handler())
 	t.Cleanup(ts.Close)
 	url := ts.URL + "/repos/example.com/acme/widget"
 

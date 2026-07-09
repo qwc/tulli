@@ -16,6 +16,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver "pgx", for goose
 	"github.com/pressly/goose/v3"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/store/pg/sqlc"
 	"codeberg.org/qwc/tulli/internal/verdict"
@@ -231,11 +232,51 @@ func (s *Store) CurrentDecision(ctx context.Context, repoID int64, ref string) (
 	return d, err
 }
 
+// --- Stage 6a: identity & access (auth.Store) ---
+
+func (s *Store) InsertUser(ctx context.Context, name string, role auth.Role, kind auth.Kind) (int64, error) {
+	return s.q.InsertUser(ctx, sqlc.InsertUserParams{Name: name, Role: string(role), Kind: string(kind)})
+}
+
+func (s *Store) InsertSSHKey(ctx context.Context, userID int64, fingerprint, pubkey string) error {
+	return s.q.InsertSSHKey(ctx, sqlc.InsertSSHKeyParams{UserID: userID, Fingerprint: fingerprint, Pubkey: pubkey})
+}
+
+func (s *Store) InsertToken(ctx context.Context, userID int64, tokenHash string) error {
+	return s.q.InsertToken(ctx, sqlc.InsertTokenParams{UserID: userID, TokenHash: tokenHash})
+}
+
+func (s *Store) UserByFingerprint(ctx context.Context, fingerprint string) (auth.Identity, bool, error) {
+	r, err := s.q.UserByFingerprint(ctx, fingerprint)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return auth.Identity{}, false, nil
+	}
+	if err != nil {
+		return auth.Identity{}, false, err
+	}
+	return auth.Identity{UserID: r.ID, Login: r.Name, Role: auth.Role(r.Role), Kind: auth.Kind(r.Kind)}, true, nil
+}
+
+func (s *Store) UserByTokenHash(ctx context.Context, tokenHash string) (auth.Identity, bool, error) {
+	r, err := s.q.UserByTokenHash(ctx, tokenHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return auth.Identity{}, false, nil
+	}
+	if err != nil {
+		return auth.Identity{}, false, err
+	}
+	return auth.Identity{UserID: r.ID, Login: r.Name, Role: auth.Role(r.Role), Kind: auth.Kind(r.Kind)}, true, nil
+}
+
 func (s *Store) InsertAccessEvent(ctx context.Context, a core.Access) error {
 	p := sqlc.InsertAccessEventParams{}
 	if a.RepoID != 0 {
 		rid := a.RepoID
 		p.RepoID = &rid
+	}
+	if a.UserID != 0 {
+		uid := a.UserID
+		p.UserID = &uid
 	}
 	if a.Status != 0 {
 		st := int32(a.Status)

@@ -21,9 +21,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 
 	"golang.org/x/crypto/ssh"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 )
@@ -31,7 +33,7 @@ import (
 // Gate is the hallway seam (implemented by *core.Gatekeeper) — identical to the
 // one httpsrv depends on, so the routing is tested with a fake.
 type Gate interface {
-	Admit(ctx context.Context, ref git.RepoRef, verb string) (core.Admission, error)
+	Admit(ctx context.Context, ref git.RepoRef, verb string, id auth.Identity) (core.Admission, error)
 	FinishAudit(ctx context.Context, a core.Access)
 }
 
@@ -42,17 +44,49 @@ type Server struct {
 }
 
 // New builds an SSH server that admits through gate and serves from hostKey.
-func New(gate Gate, hostKey ssh.Signer, log *slog.Logger) *Server {
+// Identity policy (stage 6a): SSH is authenticated — the presented public key
+// must resolve to a known user (human or robot); an unregistered key is rejected
+// at the handshake. (HTTP, by contrast, allows anonymous fetches.)
+func New(gate Gate, authr auth.Authenticator, hostKey ssh.Signer, log *slog.Logger) *Server {
 	cfg := &ssh.ServerConfig{
-		// Stage 5: anonymous. Accept any key but stash its fingerprint so the
-		// audit trail is ready for the stage-6 pubkey→user lookup (which will
-		// reject unknown keys here instead of accepting them).
 		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			return &ssh.Permissions{Extensions: map[string]string{"pubkey-fp": ssh.FingerprintSHA256(key)}}, nil
+			fp := ssh.FingerprintSHA256(key)
+			id, ok, err := authr.ByPublicKey(context.Background(), fp)
+			if err != nil {
+				return nil, fmt.Errorf("ssh auth lookup: %w", err)
+			}
+			if !ok {
+				return nil, fmt.Errorf("unregistered ssh key %s", fp)
+			}
+			return &ssh.Permissions{Extensions: identityExtensions(id)}, nil
 		},
 	}
 	cfg.AddHostKey(hostKey)
 	return &Server{gate: gate, cfg: cfg, log: log}
+}
+
+// identityExtensions carries the resolved identity across the handshake into the
+// session handler (ssh.Permissions.Extensions is string-only).
+func identityExtensions(id auth.Identity) map[string]string {
+	return map[string]string{
+		"tulli-uid":   strconv.FormatInt(id.UserID, 10),
+		"tulli-login": id.Login,
+		"tulli-role":  string(id.Role),
+		"tulli-kind":  string(id.Kind),
+	}
+}
+
+func identityFromPermissions(p *ssh.Permissions) auth.Identity {
+	if p == nil {
+		return auth.Anonymous
+	}
+	uid, _ := strconv.ParseInt(p.Extensions["tulli-uid"], 10, 64)
+	return auth.Identity{
+		UserID: uid,
+		Login:  p.Extensions["tulli-login"],
+		Role:   auth.Role(p.Extensions["tulli-role"]),
+		Kind:   auth.Kind(p.Extensions["tulli-kind"]),
+	}
 }
 
 // ListenAndServe listens on addr until ctx is cancelled (which closes the
@@ -91,10 +125,7 @@ func (s *Server) handleConn(ctx context.Context, nConn net.Conn) {
 	go ssh.DiscardRequests(reqs) // no global requests are honoured
 
 	srcIP := remoteIP(sconn.RemoteAddr())
-	fp := ""
-	if sconn.Permissions != nil {
-		fp = sconn.Permissions.Extensions["pubkey-fp"]
-	}
+	id := identityFromPermissions(sconn.Permissions)
 
 	for newChan := range chans {
 		if newChan.ChannelType() != "session" {
@@ -106,14 +137,14 @@ func (s *Server) handleConn(ctx context.Context, nConn net.Conn) {
 			s.log.Debug("channel accept failed", "err", err)
 			continue
 		}
-		go s.handleSession(ctx, ch, chReqs, srcIP, fp)
+		go s.handleSession(ctx, ch, chReqs, srcIP, id)
 	}
 }
 
 // handleSession consumes a session's requests: it captures GIT_PROTOCOL (for
 // protocol v2) and dispatches the single exec that git sends. Interactive
 // requests (shell/pty) are refused — this is not a login server.
-func (s *Server) handleSession(ctx context.Context, ch ssh.Channel, reqs <-chan *ssh.Request, srcIP, fp string) {
+func (s *Server) handleSession(ctx context.Context, ch ssh.Channel, reqs <-chan *ssh.Request, srcIP string, id auth.Identity) {
 	defer ch.Close()
 	var gitProtocol string
 	for req := range reqs {
@@ -131,7 +162,7 @@ func (s *Server) handleSession(ctx context.Context, ch ssh.Channel, reqs <-chan 
 				return
 			}
 			reply(req, true)
-			s.runGit(ctx, ch, e.Command, gitProtocol, srcIP, fp)
+			s.runGit(ctx, ch, e.Command, gitProtocol, srcIP, id)
 			return // exactly one exec per git session
 		default:
 			reply(req, false) // shell, pty-req, subsystem, … not supported
@@ -141,7 +172,7 @@ func (s *Server) handleSession(ctx context.Context, ch ssh.Channel, reqs <-chan 
 
 // runGit parses the git command, admits it through the hallway, and either
 // streams `git upload-pack` to the channel or reports the block on stderr.
-func (s *Server) runGit(ctx context.Context, ch ssh.Channel, command, gitProtocol, srcIP, fp string) {
+func (s *Server) runGit(ctx context.Context, ch ssh.Channel, command, gitProtocol, srcIP string, id auth.Identity) {
 	ref, verb, err := git.ParseSSHCommand(command)
 	if err != nil {
 		fmt.Fprintln(ch.Stderr(), "tulli: unsupported command (this is a read-only git proxy)")
@@ -149,7 +180,7 @@ func (s *Server) runGit(ctx context.Context, ch ssh.Channel, command, gitProtoco
 		return
 	}
 
-	adm, err := s.gate.Admit(ctx, ref, verb)
+	adm, err := s.gate.Admit(ctx, ref, verb, id)
 	if err != nil {
 		s.log.Error("admit failed", "ref", ref.String(), "verb", verb, "err", err)
 		fmt.Fprintln(ch.Stderr(), "tulli: upstream mirror unavailable")
@@ -164,7 +195,7 @@ func (s *Server) runGit(ctx context.Context, ch ssh.Channel, command, gitProtoco
 		return
 	}
 
-	s.log.Info("serve", "ref", ref.String(), "verb", verb, "src", srcIP, "key", fp)
+	s.log.Info("serve", "ref", ref.String(), "verb", verb, "src", srcIP, "user", id.Login)
 	cmd := exec.CommandContext(ctx, "git", "upload-pack", adm.RepoPath)
 	if gitProtocol != "" {
 		cmd.Env = append(os.Environ(), "GIT_PROTOCOL="+gitProtocol)
@@ -176,7 +207,7 @@ func (s *Server) runGit(ctx context.Context, ch ssh.Channel, command, gitProtoco
 	code := exitCode(cmd.Run())
 	exit(ch, code)
 
-	s.gate.FinishAudit(ctx, core.Access{RepoID: adm.RepoID, SourceIP: srcIP, Status: 200, Bytes: cw.n})
+	s.gate.FinishAudit(ctx, core.Access{RepoID: adm.RepoID, UserID: adm.UserID, SourceIP: srcIP, Status: 200, Bytes: cw.n})
 }
 
 // countWriter counts the bytes streamed to the client for the audit trail.

@@ -8,6 +8,7 @@ import (
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/verdict"
 )
@@ -199,6 +200,50 @@ func TestPG_ScanFindingsAndRecompute(t *testing.T) {
 	}
 	if d, err := s.CurrentDecision(ctx, id, "refs/heads/evil"); err != nil || d != verdict.DecisionClean {
 		t.Fatalf("after override decision = %q, %v, want CLEAN", d, err)
+	}
+}
+
+// TestPG_AuthLookups exercises stage-6a identity on real Postgres: a user with a
+// role/kind, an SSH key, and a token all round-trip through the auth.Store
+// lookups (migration 00004 applied), and unknown credentials do not resolve.
+func TestPG_AuthLookups(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	uid, err := s.InsertUser(ctx, "ci-bot", auth.RoleReviewer, auth.KindRobot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertSSHKey(ctx, uid, "SHA256:abc", "ssh-ed25519 AAAAC3Nz..."); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertToken(ctx, uid, auth.HashToken("raw-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	id, ok, err := s.UserByFingerprint(ctx, "SHA256:abc")
+	if err != nil || !ok {
+		t.Fatalf("UserByFingerprint ok=%v err=%v", ok, err)
+	}
+	if id.UserID != uid || id.Login != "ci-bot" || id.Role != auth.RoleReviewer || id.Kind != auth.KindRobot {
+		t.Fatalf("identity = %+v, want the robot reviewer just inserted", id)
+	}
+
+	id2, ok, err := s.UserByTokenHash(ctx, auth.HashToken("raw-token"))
+	if err != nil || !ok || id2.UserID != uid {
+		t.Fatalf("UserByTokenHash = %+v ok=%v err=%v", id2, ok, err)
+	}
+
+	if _, ok, _ := s.UserByFingerprint(ctx, "SHA256:missing"); ok {
+		t.Error("unknown fingerprint must not resolve")
+	}
+	if _, ok, _ := s.UserByTokenHash(ctx, auth.HashToken("wrong")); ok {
+		t.Error("unknown token must not resolve")
 	}
 }
 

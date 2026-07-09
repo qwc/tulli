@@ -11,14 +11,16 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 )
 
 // Gate is the hallway seam (implemented by *core.Gatekeeper).
 type Gate interface {
-	Admit(ctx context.Context, ref git.RepoRef, verb string) (core.Admission, error)
+	Admit(ctx context.Context, ref git.RepoRef, verb string, id auth.Identity) (core.Admission, error)
 	FinishAudit(ctx context.Context, a core.Access)
 }
 
@@ -29,13 +31,18 @@ type Handoff interface {
 
 type Server struct {
 	gate    Gate
+	authr   auth.Authenticator
 	backend Handoff
 	log     *slog.Logger
 }
 
-func New(gate Gate, backend Handoff, log *slog.Logger) *Server {
-	return &Server{gate: gate, backend: backend, log: log}
+func New(gate Gate, authr auth.Authenticator, backend Handoff, log *slog.Logger) *Server {
+	return &Server{gate: gate, authr: authr, backend: backend, log: log}
 }
+
+// errInvalidToken marks a present-but-unresolvable credential (surfaced as 401);
+// a missing credential is anonymous, not an error.
+var errInvalidToken = errors.New("invalid credentials")
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -64,7 +71,17 @@ func (s *Server) serveRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adm, err := s.gate.Admit(r.Context(), ref, verb)
+	// Identity is optional over HTTP: an anonymous fetch of a public repo is
+	// allowed; a present-but-invalid token is rejected rather than silently
+	// downgraded (a typo'd token shouldn't read as anonymous).
+	id, err := s.authenticate(r)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="tulli"`)
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	adm, err := s.gate.Admit(r.Context(), ref, verb, id)
 	if err != nil {
 		s.log.Error("admit failed", "ref", ref.String(), "verb", verb, "err", err)
 		http.Error(w, "upstream mirror unavailable", http.StatusBadGateway)
@@ -87,10 +104,44 @@ func (s *Server) serveRepos(w http.ResponseWriter, r *http.Request) {
 	s.backend.Serve(cw, r, adm.RepoPath, verb)
 	s.gate.FinishAudit(r.Context(), core.Access{
 		RepoID:   adm.RepoID,
+		UserID:   adm.UserID,
 		SourceIP: clientIP(r),
 		Status:   cw.status(),
 		Bytes:    cw.n,
 	})
+}
+
+// authenticate resolves the request's optional credential to an identity. No
+// Authorization header → anonymous (allowed for public fetch). A present token
+// (bearer, or the password field of git's basic auth) that does not resolve →
+// errInvalidToken.
+func (s *Server) authenticate(r *http.Request) (auth.Identity, error) {
+	tok, ok := requestToken(r)
+	if !ok {
+		return auth.Anonymous, nil
+	}
+	id, ok, err := s.authr.ByToken(r.Context(), tok)
+	if err != nil {
+		return auth.Anonymous, err
+	}
+	if !ok {
+		return auth.Anonymous, errInvalidToken
+	}
+	return id, nil
+}
+
+// requestToken extracts a token from the Authorization header: a bearer token,
+// or the password of HTTP basic auth (how a git client presents a token).
+func requestToken(r *http.Request) (string, bool) {
+	if h := r.Header.Get("Authorization"); h != "" {
+		if t, ok := strings.CutPrefix(h, "Bearer "); ok {
+			return t, true
+		}
+	}
+	if _, pass, ok := r.BasicAuth(); ok && pass != "" {
+		return pass, true
+	}
+	return "", false
 }
 
 // countingWriter records the response status and byte count for the audit trail

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/git"
 )
 
@@ -68,7 +69,7 @@ func TestAdmit_UploadPackAllowedAndRecordsRepo(t *testing.T) {
 	fs := &fakeStore{repoID: 7}
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "github.com", Path: "o/r"}, git.VerbUploadPack)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "github.com", Path: "o/r"}, git.VerbUploadPack, auth.Anonymous)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +89,7 @@ func TestAdmit_ReceivePackRefused(t *testing.T) {
 	fs := &fakeStore{}
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbReceivePack)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbReceivePack, auth.Anonymous)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +106,7 @@ func TestAdmit_ReceivePackRefused(t *testing.T) {
 
 func TestAdmit_MirrorErrorPropagates(t *testing.T) {
 	g := New(&fakeMirror{err: errors.New("upstream gone")}, &fakeStore{}, nil, discardLogger())
-	if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err == nil {
+	if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous); err == nil {
 		t.Fatal("want mirror error propagated")
 	}
 }
@@ -116,7 +117,7 @@ func TestAdmit_StoreErrorStillServes(t *testing.T) {
 	fs := &fakeStore{upErr: errors.New("db down")}
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous)
 	if err != nil {
 		t.Fatalf("store error must not fail admit: %v", err)
 	}
@@ -133,7 +134,7 @@ func TestAdmit_RepoWideQuarantineBlocks(t *testing.T) {
 	fs := &fakeStore{repoID: 7, verdict: Verdict{RepoBlocked: true, Reason: "3 HIGH secrets (gitleaks)"}}
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +157,7 @@ func TestAdmit_RefLevelQuarantineHidesAndServes(t *testing.T) {
 	fs := &fakeStore{repoID: 7, verdict: Verdict{HiddenRefs: []string{"refs/heads/evil", "refs/tags/bad"}}}
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +178,7 @@ func TestAdmit_HideRefsFailureFailsClosed(t *testing.T) {
 	fs := &fakeStore{repoID: 7, verdict: Verdict{HiddenRefs: []string{"refs/heads/evil"}}}
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +193,7 @@ func TestAdmit_VerdictErrorFailsOpen(t *testing.T) {
 	fs := &fakeStore{repoID: 7, verdErr: errors.New("db hiccup")}
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous)
 	if err != nil {
 		t.Fatalf("verdict error must not fail admit: %v", err)
 	}
@@ -206,7 +207,7 @@ func TestAdmit_CleanServesWithoutHiding(t *testing.T) {
 	fs := &fakeStore{repoID: 7} // zero-value Verdict = clean
 	g := New(fm, fs, nil, discardLogger())
 
-	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +225,7 @@ func TestAdmit_EnqueuesScanOnlyOnCreate(t *testing.T) {
 	t.Run("created", func(t *testing.T) {
 		enq := &fakeEnqueuer{}
 		g := New(&fakeMirror{dir: "/m/x.git", created: true}, &fakeStore{repoID: 7}, enq, discardLogger())
-		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err != nil {
+		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous); err != nil {
 			t.Fatal(err)
 		}
 		if len(enq.reqs) != 1 || enq.reqs[0].RepoID != 7 || enq.reqs[0].RepoPath != "/m/x.git" {
@@ -234,7 +235,7 @@ func TestAdmit_EnqueuesScanOnlyOnCreate(t *testing.T) {
 	t.Run("cache hit", func(t *testing.T) {
 		enq := &fakeEnqueuer{}
 		g := New(&fakeMirror{dir: "/m/x.git", created: false}, &fakeStore{repoID: 7}, enq, discardLogger())
-		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err != nil {
+		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous); err != nil {
 			t.Fatal(err)
 		}
 		if len(enq.reqs) != 0 {
@@ -245,7 +246,7 @@ func TestAdmit_EnqueuesScanOnlyOnCreate(t *testing.T) {
 		enq := &fakeEnqueuer{}
 		fs := &fakeStore{repoID: 7, verdict: Verdict{RepoBlocked: true}}
 		g := New(&fakeMirror{dir: "/m/x.git", created: true}, fs, enq, discardLogger())
-		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err != nil {
+		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Anonymous); err != nil {
 			t.Fatal(err)
 		}
 		if len(enq.reqs) != 0 {
@@ -269,5 +270,29 @@ func TestFinishAudit_SkipsWhenNoRepoID(t *testing.T) {
 	g.FinishAudit(context.Background(), Access{RepoID: 0, Status: 200})
 	if len(fs.events) != 0 {
 		t.Fatalf("no event should be recorded without a repo id; got %+v", fs.events)
+	}
+}
+
+// The resolved principal is stamped onto every admission (allow or block) so the
+// audit trail attributes the fetch to a user (stage 6a).
+func TestAdmit_StampsIdentity(t *testing.T) {
+	g := New(&fakeMirror{dir: "/m/x.git"}, &fakeStore{repoID: 7}, nil, discardLogger())
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs,
+		auth.Identity{UserID: 42, Login: "ci-bot", Role: auth.RoleViewer, Kind: auth.KindRobot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adm.UserID != 42 {
+		t.Errorf("served admission UserID = %d, want 42", adm.UserID)
+	}
+
+	// Even a blocked admission carries the principal.
+	gb := New(&fakeMirror{dir: "/m/x.git"}, &fakeStore{repoID: 7, verdict: Verdict{RepoBlocked: true}}, nil, discardLogger())
+	badm, err := gb.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs, auth.Identity{UserID: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if badm.Allowed || badm.UserID != 9 {
+		t.Errorf("blocked admission = %+v, want !Allowed with UserID 9", badm)
 	}
 }

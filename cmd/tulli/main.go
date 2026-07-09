@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
@@ -34,6 +35,7 @@ type backend interface {
 	core.Store
 	scan.Store
 	mirror.Store
+	auth.Store
 }
 
 func envOr(key, def string) string {
@@ -108,15 +110,19 @@ func main() {
 
 	gate := core.New(m, st, worker, log)
 
+	// Identity provider (stage 6a): the local database is the first provider;
+	// LDAP/OIDC slot in behind auth.Authenticator later.
+	authr := auth.NewDBProvider(st)
+
 	// SSH door (second transport onto the same hallway). Optional: only when an
-	// address is configured. Anonymous in this stage (see internal/sshsrv).
+	// address is configured. SSH is authenticated — unknown keys are rejected.
 	if *sshAddr != "" {
 		hostKey, err := sshsrv.LoadOrCreateHostKey(filepath.Join(*data, "ssh_host_ed25519_key"))
 		if err != nil {
 			log.Error("ssh host key unavailable", "err", err)
 			os.Exit(1)
 		}
-		ssrv := sshsrv.New(gate, hostKey, log)
+		ssrv := sshsrv.New(gate, authr, hostKey, log)
 		go func() {
 			log.Info("tulli ssh listening", "addr", *sshAddr)
 			if err := ssrv.ListenAndServe(ctx, *sshAddr); err != nil {
@@ -126,7 +132,7 @@ func main() {
 		}()
 	}
 
-	srv := httpsrv.New(gate, httpBackend, log)
+	srv := httpsrv.New(gate, authr, httpBackend, log)
 	log.Info("tulli listening", "addr", *addr, "mirrors", mirrorRoot, "upstreamBase", *upstreamBase, "store", storeKind)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Error("server exited", "err", err)

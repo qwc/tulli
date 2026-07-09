@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/verdict"
 )
@@ -25,6 +26,11 @@ type Mem struct {
 	findings  map[int64][]memFinding     // repo_id -> findings
 	overrides map[int64][]memOverride    // repo_id -> overrides
 	blocks    map[int64][]memManualBlock // repo_id -> manual blocks, newest last
+
+	users    map[int64]auth.Identity // user_id -> identity (role/kind/login)
+	sshKeys  map[string]int64        // fingerprint -> user_id
+	tokens   map[string]int64        // token_hash -> user_id
+	nextUser int64
 }
 
 // memVerdict mirrors a row of the verdicts table (spec §9). ref == "" is a
@@ -61,6 +67,9 @@ func NewMem() *Mem {
 		findings:  make(map[int64][]memFinding),
 		overrides: make(map[int64][]memOverride),
 		blocks:    make(map[int64][]memManualBlock),
+		users:     make(map[int64]auth.Identity),
+		sshKeys:   make(map[string]int64),
+		tokens:    make(map[string]int64),
 	}
 }
 
@@ -257,6 +266,55 @@ func (m *Mem) ManualBlockRefs(_ context.Context, repoID int64) ([]string, error)
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// --- Stage 6a: identity & access (auth.Store) ---
+
+// InsertUser creates a user and returns its id (seed/web writer).
+func (m *Mem) InsertUser(_ context.Context, name string, role auth.Role, kind auth.Kind) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextUser++
+	m.users[m.nextUser] = auth.Identity{UserID: m.nextUser, Login: name, Role: role, Kind: kind}
+	return m.nextUser, nil
+}
+
+// InsertSSHKey registers an SSH public key (by fingerprint) for a user.
+func (m *Mem) InsertSSHKey(_ context.Context, userID int64, fingerprint, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sshKeys[fingerprint] = userID
+	return nil
+}
+
+// InsertToken registers a hashed HTTP token for a user.
+func (m *Mem) InsertToken(_ context.Context, userID int64, tokenHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokens[tokenHash] = userID
+	return nil
+}
+
+func (m *Mem) UserByFingerprint(_ context.Context, fingerprint string) (auth.Identity, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	uid, ok := m.sshKeys[fingerprint]
+	if !ok {
+		return auth.Identity{}, false, nil
+	}
+	id, ok := m.users[uid]
+	return id, ok, nil
+}
+
+func (m *Mem) UserByTokenHash(_ context.Context, tokenHash string) (auth.Identity, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	uid, ok := m.tokens[tokenHash]
+	if !ok {
+		return auth.Identity{}, false, nil
+	}
+	id, ok := m.users[uid]
+	return id, ok, nil
 }
 
 // Events returns a copy of the recorded access events (for tests/inspection).

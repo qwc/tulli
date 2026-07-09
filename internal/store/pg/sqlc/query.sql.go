@@ -170,14 +170,15 @@ func (q *Queries) FindingsForRef(ctx context.Context, arg FindingsForRefParams) 
 }
 
 const insertAccessEvent = `-- name: InsertAccessEvent :exec
-INSERT INTO access_events (repo_id, source_ip, http_status, bytes)
-VALUES ($1, $4::inet, $2, $3)
+INSERT INTO access_events (repo_id, user_id, source_ip, http_status, bytes)
+VALUES ($1, $4, $5::inet, $2, $3)
 `
 
 type InsertAccessEventParams struct {
 	RepoID     *int64
 	HttpStatus *int32
 	Bytes      *int64
+	UserID     *int64
 	SourceIp   *netip.Addr
 }
 
@@ -186,6 +187,7 @@ func (q *Queries) InsertAccessEvent(ctx context.Context, arg InsertAccessEventPa
 		arg.RepoID,
 		arg.HttpStatus,
 		arg.Bytes,
+		arg.UserID,
 		arg.SourceIp,
 	)
 	return err
@@ -277,6 +279,21 @@ func (q *Queries) InsertOverride(ctx context.Context, arg InsertOverrideParams) 
 	return err
 }
 
+const insertSSHKey = `-- name: InsertSSHKey :exec
+INSERT INTO ssh_keys (user_id, fingerprint, pubkey) VALUES ($1, $2, $3)
+`
+
+type InsertSSHKeyParams struct {
+	UserID      int64
+	Fingerprint string
+	Pubkey      string
+}
+
+func (q *Queries) InsertSSHKey(ctx context.Context, arg InsertSSHKeyParams) error {
+	_, err := q.db.Exec(ctx, insertSSHKey, arg.UserID, arg.Fingerprint, arg.Pubkey)
+	return err
+}
+
 const insertScan = `-- name: InsertScan :one
 INSERT INTO scans (repo_id, scanner, scope_kind, scope_expr, status, finished_at)
 VALUES ($1, $2, $3, $4, 'COMPLETE', NOW())
@@ -297,6 +314,39 @@ func (q *Queries) InsertScan(ctx context.Context, arg InsertScanParams) (int64, 
 		arg.ScopeKind,
 		arg.ScopeExpr,
 	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const insertToken = `-- name: InsertToken :exec
+INSERT INTO tokens (user_id, token_hash) VALUES ($1, $2)
+`
+
+type InsertTokenParams struct {
+	UserID    int64
+	TokenHash string
+}
+
+func (q *Queries) InsertToken(ctx context.Context, arg InsertTokenParams) error {
+	_, err := q.db.Exec(ctx, insertToken, arg.UserID, arg.TokenHash)
+	return err
+}
+
+const insertUser = `-- name: InsertUser :one
+
+INSERT INTO users (name, role, kind) VALUES ($1, $2, $3) RETURNING id
+`
+
+type InsertUserParams struct {
+	Name string
+	Role string
+	Kind string
+}
+
+// Stage 6a: identity & access (auth.Store).
+func (q *Queries) InsertUser(ctx context.Context, arg InsertUserParams) (int64, error) {
+	row := q.db.QueryRow(ctx, insertUser, arg.Name, arg.Role, arg.Kind)
 	var id int64
 	err := row.Scan(&id)
 	return id, err
@@ -426,4 +476,54 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (int64, 
 	var id int64
 	err := row.Scan(&id)
 	return id, err
+}
+
+const userByFingerprint = `-- name: UserByFingerprint :one
+SELECT u.id, u.name, u.role, u.kind
+FROM ssh_keys k JOIN users u ON u.id = k.user_id
+WHERE k.fingerprint = $1
+`
+
+type UserByFingerprintRow struct {
+	ID   int64
+	Name string
+	Role string
+	Kind string
+}
+
+func (q *Queries) UserByFingerprint(ctx context.Context, fingerprint string) (UserByFingerprintRow, error) {
+	row := q.db.QueryRow(ctx, userByFingerprint, fingerprint)
+	var i UserByFingerprintRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Role,
+		&i.Kind,
+	)
+	return i, err
+}
+
+const userByTokenHash = `-- name: UserByTokenHash :one
+SELECT u.id, u.name, u.role, u.kind
+FROM tokens t JOIN users u ON u.id = t.user_id
+WHERE t.token_hash = $1
+`
+
+type UserByTokenHashRow struct {
+	ID   int64
+	Name string
+	Role string
+	Kind string
+}
+
+func (q *Queries) UserByTokenHash(ctx context.Context, tokenHash string) (UserByTokenHashRow, error) {
+	row := q.db.QueryRow(ctx, userByTokenHash, tokenHash)
+	var i UserByTokenHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Role,
+		&i.Kind,
+	)
+	return i, err
 }

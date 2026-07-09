@@ -31,6 +31,16 @@ Early prototype, built in stages (see `IMPLEMENTATION.md` §5).
   retro-quarantines the affected ref(s); a fingerprint override lifts the block.
   A reconciler keeps on-disk `hideRefs` matching the DB (event-driven + a periodic
   safety sweep). No operator CLI/web yet — administration is the stage-6 web API.
+- **Stage 5 ✅** — SSH transport: a second door onto the same hallway
+  (`git clone ssh://…`). Blocks surface on the session's stderr (`remote: …`);
+  ref-level quarantine flows through the exec'd `git upload-pack` for free.
+- **Stage 6a ✅** — identity & access: an SSH public key or an HTTP token resolves
+  to a user (with a role and human/robot kind) behind a pluggable provider seam
+  (local DB now; LDAP/OIDC later). SSH requires a known key; HTTP fetches stay
+  anonymous-friendly (a present-but-invalid token is a 401). Fetches are attributed
+  to the resolved user in the audit trail. Verdicts also carry provenance — human
+  quarantines live in a `manual_blocks` input table so the recompute sweep can't
+  clobber them.
 
 ### Known limitation (Strategy A)
 
@@ -122,7 +132,16 @@ internal/verdict  blocking-set rule + recompute (findings + overrides → verdic
 internal/scan     Scanner seam + gitleaks adapter + async fail-open-once worker
 internal/mirror   reconciler: DB verdicts → on-disk hideRefs (event + sweep)
 internal/httpsrv  HTTP door onto the hallway
+internal/sshsrv   SSH door onto the hallway (x/crypto/ssh)
+internal/auth     identity & access: credential → user, pluggable provider seam
 internal/store    backends: Mem (test fake) + pg/ (Postgres, sqlc)
 migrations/       embedded goose schema (spec §9)
 spike/stage0      throwaway proof of the CGI handoff (reference)
 ```
+
+## License
+
+[GNU AGPL-3.0](LICENSE). tulli is a network service, so the AGPL's §13 keeps
+improvements shared: anyone who runs a modified version and lets users reach it
+over the network must offer them the source. Using tulli imposes no obligation;
+only modifying-and-serving does.

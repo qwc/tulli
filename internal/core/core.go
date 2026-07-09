@@ -9,6 +9,7 @@ import (
 	"context"
 	"log/slog"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/git"
 )
 
@@ -18,6 +19,7 @@ type Admission struct {
 	Allowed  bool
 	RepoPath string // bare mirror path the transport serves from
 	RepoID   int64  // audit handle for the resolved repo (0 = not recorded)
+	UserID   int64  // resolved principal for the audit trail (0 = anonymous)
 	Verb     string
 	BlockMsg string // remote: message when !Allowed (spec §3.3)
 }
@@ -33,6 +35,7 @@ type RepoInfo struct {
 // don't yet parse.
 type Access struct {
 	RepoID   int64
+	UserID   int64 // resolved principal (0 = anonymous)
 	SourceIP string
 	Status   int
 	Bytes    int64
@@ -99,7 +102,15 @@ func New(m Mirror, s Store, enq Enqueuer, log *slog.Logger) *Gatekeeper {
 }
 
 // Admit runs resolve(done by the adapter) → ensure-mirrored → record-repo → gate.
-func (g *Gatekeeper) Admit(ctx context.Context, ref git.RepoRef, verb string) (Admission, error) {
+// The identity was resolved by the transport adapter (SSH pubkey / HTTP token)
+// and is stamped onto the returned Admission for the audit trail; the git-serving
+// path does not yet authorize by role (public FOSS is anonymously fetchable), but
+// this is the seam a later identity-aware gate (private repos, per-user policy)
+// hooks into.
+func (g *Gatekeeper) Admit(ctx context.Context, ref git.RepoRef, verb string, id auth.Identity) (adm Admission, err error) {
+	// Every admission (allow or block) is attributed to the resolved principal.
+	defer func() { adm.UserID = id.UserID }()
+
 	// Read-only invariant (IMPLEMENTATION.md §1): never serve push.
 	if verb == git.VerbReceivePack {
 		return Admission{

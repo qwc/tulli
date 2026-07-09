@@ -9,29 +9,50 @@ import (
 	"strings"
 	"testing"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+type admitFunc func(ctx context.Context, ref git.RepoRef, verb string, id auth.Identity) (core.Admission, error)
+
 type fakeGate struct {
-	admitFn     func(ctx context.Context, ref git.RepoRef, verb string) (core.Admission, error)
+	admitFn     admitFunc
 	admitCalls  int
 	finishCalls int
 	gotRef      git.RepoRef
 	gotVerb     string
+	gotID       auth.Identity
 	gotAccess   core.Access
 }
 
-func (f *fakeGate) Admit(ctx context.Context, ref git.RepoRef, verb string) (core.Admission, error) {
+func (f *fakeGate) Admit(ctx context.Context, ref git.RepoRef, verb string, id auth.Identity) (core.Admission, error) {
 	f.admitCalls++
-	f.gotRef, f.gotVerb = ref, verb
-	return f.admitFn(ctx, ref, verb)
+	f.gotRef, f.gotVerb, f.gotID = ref, verb, id
+	adm, err := f.admitFn(ctx, ref, verb, id)
+	adm.UserID = id.UserID // mirror the real Gatekeeper stamping the principal
+	return adm, err
 }
 func (f *fakeGate) FinishAudit(_ context.Context, a core.Access) {
 	f.finishCalls++
 	f.gotAccess = a
+}
+
+// fakeAuth resolves tokens/keys from fixed maps (empty = everything anonymous).
+type fakeAuth struct {
+	tokens map[string]auth.Identity
+	keys   map[string]auth.Identity
+}
+
+func (f fakeAuth) ByToken(_ context.Context, tok string) (auth.Identity, bool, error) {
+	id, ok := f.tokens[tok]
+	return id, ok, nil
+}
+func (f fakeAuth) ByPublicKey(_ context.Context, fp string) (auth.Identity, bool, error) {
+	id, ok := f.keys[fp]
+	return id, ok, nil
 }
 
 type fakeHandoff struct {
@@ -46,10 +67,10 @@ func (f *fakeHandoff) Serve(w http.ResponseWriter, _ *http.Request, repoPath, ve
 	_, _ = w.Write([]byte("SERVED"))
 }
 
-func newTestServer(admit func(ctx context.Context, ref git.RepoRef, verb string) (core.Admission, error)) (*Server, *fakeGate, *fakeHandoff) {
+func newTestServer(admit admitFunc) (*Server, *fakeGate, *fakeHandoff) {
 	g := &fakeGate{admitFn: admit}
 	h := &fakeHandoff{}
-	return New(g, h, discardLogger()), g, h
+	return New(g, fakeAuth{}, h, discardLogger()), g, h
 }
 
 func do(srv *Server, method, target string) *httptest.ResponseRecorder {
@@ -59,8 +80,8 @@ func do(srv *Server, method, target string) *httptest.ResponseRecorder {
 	return rr
 }
 
-func allow(path string) func(context.Context, git.RepoRef, string) (core.Admission, error) {
-	return func(_ context.Context, _ git.RepoRef, verb string) (core.Admission, error) {
+func allow(path string) admitFunc {
+	return func(_ context.Context, _ git.RepoRef, verb string, _ auth.Identity) (core.Admission, error) {
 		return core.Admission{Allowed: true, RepoPath: path, RepoID: 42, Verb: verb}, nil
 	}
 }
@@ -119,7 +140,7 @@ func TestServeRepos_ReceivePackServiceRefused(t *testing.T) {
 }
 
 func TestServeRepos_AdmitErrorIsBadGateway(t *testing.T) {
-	srv, _, _ := newTestServer(func(context.Context, git.RepoRef, string) (core.Admission, error) {
+	srv, _, _ := newTestServer(func(context.Context, git.RepoRef, string, auth.Identity) (core.Admission, error) {
 		return core.Admission{}, io.ErrUnexpectedEOF
 	})
 	rr := do(srv, "GET", "/repos/github.com/o/r/info/refs?service=git-upload-pack")
@@ -131,7 +152,7 @@ func TestServeRepos_AdmitErrorIsBadGateway(t *testing.T) {
 // At info/refs a block must be an ERR pkt-line (200 body), which is the only
 // form a real git client surfaces (spec §3.3) — not a plain 403.
 func TestServeRepos_QuarantinedInfoRefsWritesErrPktLine(t *testing.T) {
-	srv, _, h := newTestServer(func(context.Context, git.RepoRef, string) (core.Admission, error) {
+	srv, _, h := newTestServer(func(context.Context, git.RepoRef, string, auth.Identity) (core.Admission, error) {
 		return core.Admission{Allowed: false, BlockMsg: "tulli: repo QUARANTINED — secret"}, nil
 	})
 	rr := do(srv, "GET", "/repos/github.com/o/r/info/refs?service=git-upload-pack")
@@ -156,7 +177,7 @@ func TestServeRepos_QuarantinedInfoRefsWritesErrPktLine(t *testing.T) {
 
 // A blocked git-upload-pack POST (or a browser) gets a plain 403 with the text.
 func TestServeRepos_QuarantinedUploadPackIsForbidden(t *testing.T) {
-	srv, _, h := newTestServer(func(context.Context, git.RepoRef, string) (core.Admission, error) {
+	srv, _, h := newTestServer(func(context.Context, git.RepoRef, string, auth.Identity) (core.Admission, error) {
 		return core.Admission{Allowed: false, BlockMsg: "tulli: repo QUARANTINED"}, nil
 	})
 	rr := do(srv, "POST", "/repos/github.com/o/r/git-upload-pack")
@@ -168,6 +189,61 @@ func TestServeRepos_QuarantinedUploadPackIsForbidden(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "QUARANTINED") {
 		t.Errorf("body = %q, want the block message", rr.Body.String())
+	}
+}
+
+// A bearer token resolves to an identity that is passed to the gate and recorded
+// in the audit trail (stage 6a).
+func TestServeRepos_TokenIdentityAudited(t *testing.T) {
+	g := &fakeGate{admitFn: allow("/m/x.git")}
+	authr := fakeAuth{tokens: map[string]auth.Identity{"s3cret": {UserID: 5, Login: "ci-bot", Kind: auth.KindRobot}}}
+	srv := New(g, authr, &fakeHandoff{}, discardLogger())
+
+	req := httptest.NewRequest("GET", "/repos/github.com/o/r/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if g.gotID.UserID != 5 {
+		t.Errorf("gate got identity %+v, want the resolved user 5", g.gotID)
+	}
+	if g.gotAccess.UserID != 5 {
+		t.Errorf("audit UserID = %d, want 5", g.gotAccess.UserID)
+	}
+}
+
+// No credentials → anonymous fetch is allowed (public FOSS over HTTP).
+func TestServeRepos_AnonymousFetchAllowed(t *testing.T) {
+	srv, g, h := newTestServer(allow("/m/x.git"))
+	rr := do(srv, "GET", "/repos/github.com/o/r/info/refs?service=git-upload-pack")
+	if rr.Code != http.StatusOK || !h.called {
+		t.Fatalf("anonymous fetch should serve; status=%d handoff=%v", rr.Code, h.called)
+	}
+	if !g.gotID.IsAnonymous() {
+		t.Errorf("gate got identity %+v, want anonymous", g.gotID)
+	}
+}
+
+// A present-but-unknown token is rejected (401), never silently downgraded to
+// anonymous, and never reaches the gate.
+func TestServeRepos_InvalidTokenUnauthorized(t *testing.T) {
+	g := &fakeGate{admitFn: allow("/m/x.git")}
+	h := &fakeHandoff{}
+	srv := New(g, fakeAuth{}, h, discardLogger()) // empty auth → any token is unknown
+
+	req := httptest.NewRequest("GET", "/repos/github.com/o/r/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("Authorization", "Bearer bogus")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if g.admitCalls != 0 || h.called {
+		t.Errorf("an invalid token must not reach gate/handoff (admit=%d handoff=%v)", g.admitCalls, h.called)
 	}
 }
 

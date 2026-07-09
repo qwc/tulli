@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/mirror"
@@ -55,7 +56,7 @@ func newSSHStack(t *testing.T, upstreamBase string) *sshStack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := sshsrv.New(gate, testHostKey(t), discardLogger())
+	srv := sshsrv.New(gate, auth.NewDBProvider(st), testHostKey(t), discardLogger())
 	go func() { _ = srv.Serve(ctx, ln) }() // ctx cancel (cleanup) closes ln
 	return &sshStack{addr: ln.Addr().String(), st: st}
 }
@@ -73,11 +74,13 @@ func testHostKey(t *testing.T) ssh.Signer {
 	return s
 }
 
-// clientKeyFile writes a throwaway OpenSSH private key and returns its path (the
-// server is anonymous — any key is accepted — but the git ssh client needs one).
-func clientKeyFile(t *testing.T) string {
+// registerClientKey writes a throwaway OpenSSH private key for the git ssh
+// client AND registers its public key with a fresh user in the store — SSH is
+// authenticated now, so an unregistered key would be rejected at the handshake.
+// Returns the key path and the id of the user it was registered to.
+func registerClientKey(t *testing.T, s *sshStack) (keyPath string, userID int64) {
 	t.Helper()
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,11 +88,24 @@ func clientKeyFile(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "id_ed25519")
-	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+	keyPath = filepath.Join(t.TempDir(), "id_ed25519")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return path
+
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, err = s.st.InsertUser(context.Background(), "ci-bot", auth.RoleReviewer, auth.KindRobot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.st.InsertSSHKey(context.Background(), userID, ssh.FingerprintSHA256(sshPub),
+		string(ssh.MarshalAuthorizedKey(sshPub))); err != nil {
+		t.Fatal(err)
+	}
+	return keyPath, userID
 }
 
 // sshGit runs a git subcommand against the SSH proxy, wiring GIT_SSH_COMMAND to a
@@ -117,7 +133,7 @@ func TestE2E_SSH_CloneThroughProxy(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "example.com/acme/widget"), "hello ssh\n")
 	s := newSSHStack(t, "file://"+up)
-	key := clientKeyFile(t)
+	key, uid := registerClientKey(t, s)
 
 	dst := filepath.Join(t.TempDir(), "clone")
 	if out, err := sshGit(t, s, key, "clone", "-q", s.url("example.com/acme/widget"), dst); err != nil {
@@ -127,18 +143,19 @@ func TestE2E_SSH_CloneThroughProxy(t *testing.T) {
 	if err != nil || string(got) != "hello ssh\n" {
 		t.Fatalf("cloned README = %q, err %v", got, err)
 	}
-	// Audit trail: the served fetch was recorded against the repo.
+	// Audit trail: the served fetch was recorded against the repo AND attributed
+	// to the authenticated user (stage 6a).
 	if s.st.RepoCount() != 1 {
 		t.Errorf("audit RepoCount = %d, want 1", s.st.RepoCount())
 	}
 	var served bool
 	for _, e := range s.st.Events() {
-		if e.Bytes > 0 && e.RepoID != 0 {
+		if e.Bytes > 0 && e.RepoID != 0 && e.UserID == uid {
 			served = true
 		}
 	}
 	if !served {
-		t.Errorf("expected an audited SSH fetch with bytes>0; got %+v", s.st.Events())
+		t.Errorf("expected an audited SSH fetch with bytes>0 attributed to user %d; got %+v", uid, s.st.Events())
 	}
 }
 
@@ -146,7 +163,7 @@ func TestE2E_SSH_RepoWideQuarantineBlocksClone(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "example.com/acme/widget"), "hello\n")
 	s := newSSHStack(t, "file://"+up)
-	key := clientKeyFile(t)
+	key, _ := registerClientKey(t, s)
 	base := "file://" + up
 
 	// First clone registers the repo (assigns its id).
@@ -176,7 +193,7 @@ func TestE2E_SSH_RefLevelQuarantineHidesRef(t *testing.T) {
 	makeUpstream(t, repo, "clean main\n")
 	makeUpstreamBranch(t, repo, "evil", "leaked secret\n")
 	s := newSSHStack(t, "file://"+up)
-	key := clientKeyFile(t)
+	key, _ := registerClientKey(t, s)
 	base := "file://" + up
 	url := s.url("example.com/acme/widget")
 

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
@@ -132,7 +133,7 @@ func newStack(t *testing.T, upstreamBase string, scanner scan.Scanner) *stack {
 	go worker.Run(ctx)
 
 	gate := core.New(mir, st, worker, discardLogger())
-	srv := httpsrv.New(gate, backend, discardLogger())
+	srv := httpsrv.New(gate, auth.NewDBProvider(st), backend, discardLogger())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return &stack{ts: ts, mirrors: mirrors, st: st, worker: worker, reconciler: reconciler}
