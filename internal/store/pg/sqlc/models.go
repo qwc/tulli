@@ -54,6 +54,16 @@ type Finding struct {
 	Ref         *string
 }
 
+type ManualBlock struct {
+	ID        int64
+	RepoID    int64
+	Ref       *string
+	Active    bool
+	Reason    string
+	Actor     string
+	CreatedAt pgtype.Timestamptz
+}
+
 type Notification struct {
 	ID          int64
 	VerdictID   int64

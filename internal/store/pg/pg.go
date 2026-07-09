@@ -187,6 +187,36 @@ func (s *Store) InsertOverride(ctx context.Context, repoID int64, ref, fingerpri
 	})
 }
 
+// InsertManualBlock records a human block/lift (verdict-provenance Option B).
+func (s *Store) InsertManualBlock(ctx context.Context, repoID int64, ref string, active bool, reason, actor string) error {
+	return s.q.InsertManualBlock(ctx, sqlc.InsertManualBlockParams{
+		RepoID: repoID, Ref: ptr(ref), Active: active, Reason: reason, Actor: actor,
+	})
+}
+
+func (s *Store) ActiveManualBlock(ctx context.Context, repoID int64, ref string) (bool, string, error) {
+	row, err := s.q.ActiveManualBlock(ctx, sqlc.ActiveManualBlockParams{RepoID: repoID, Ref: ptr(ref)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, "", nil // no manual block recorded
+	}
+	if err != nil {
+		return false, "", err
+	}
+	return row.Active, row.Reason, nil
+}
+
+func (s *Store) ManualBlockRefs(ctx context.Context, repoID int64) ([]string, error) {
+	rows, err := s.q.ManualBlockRefs(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, str(r)) // NULL ref -> "" (repo-wide)
+	}
+	return out, nil
+}
+
 func (s *Store) InsertVerdict(ctx context.Context, repoID int64, ref, decision, reason string) error {
 	return s.q.InsertVerdict(ctx, sqlc.InsertVerdictParams{
 		RepoID: repoID, Ref: ptr(ref), Decision: decision, Reason: ptr(reason),

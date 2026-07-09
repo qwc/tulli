@@ -201,3 +201,70 @@ func TestPG_ScanFindingsAndRecompute(t *testing.T) {
 		t.Fatalf("after override decision = %q, %v, want CLEAN", d, err)
 	}
 }
+
+// TestPG_ManualBlockSurvivesRecompute exercises verdict-provenance (Option B) on
+// real Postgres: a human block with NO backing finding must survive repeated
+// recompute sweeps (the latent clobber), enforce as a repo-wide block, and lift
+// cleanly. Also covers a ref-level manual block hiding exactly that ref.
+func TestPG_ManualBlockSurvivesRecompute(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	id, err := s.UpsertRepo(ctx, "https://github.com/o/toxic", "/m/toxic.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Repo-wide human block (no finding backs it).
+	if err := s.InsertManualBlock(ctx, id, "", true, "toxic — do not use", "itsec"); err != nil {
+		t.Fatal(err)
+	}
+	if active, reason, err := s.ActiveManualBlock(ctx, id, ""); err != nil || !active || reason != "toxic — do not use" {
+		t.Fatalf("ActiveManualBlock = %v/%q/%v", active, reason, err)
+	}
+
+	// Two recompute sweeps — the second is the one that used to clobber to CLEAN.
+	for i := 0; i < 2; i++ {
+		if err := verdict.RecomputeRepo(ctx, s, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d, err := s.CurrentDecision(ctx, id, ""); err != nil || d != verdict.DecisionQuarantined {
+		t.Fatalf("repo-wide decision = %q, %v after sweeps, want QUARANTINED", d, err)
+	}
+	v, _ := s.ResolveVerdict(ctx, id)
+	if !v.RepoBlocked || v.Reason != "toxic — do not use" {
+		t.Fatalf("ResolveVerdict = %+v, want RepoBlocked with the human reason", v)
+	}
+
+	// Human lifts the block → recompute clears it.
+	if err := s.InsertManualBlock(ctx, id, "", false, "cleared", "itsec"); err != nil {
+		t.Fatal(err)
+	}
+	if err := verdict.RecomputeRepo(ctx, s, id); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := s.CurrentDecision(ctx, id, ""); d != verdict.DecisionClean {
+		t.Fatalf("after lift, repo-wide decision = %q, want CLEAN", d)
+	}
+	if v, _ := s.ResolveVerdict(ctx, id); v.RepoBlocked {
+		t.Fatalf("after lift, ResolveVerdict still RepoBlocked: %+v", v)
+	}
+
+	// A ref-level manual block hides exactly that ref.
+	if err := s.InsertManualBlock(ctx, id, "refs/heads/suspect", true, "possible malware", "itsec"); err != nil {
+		t.Fatal(err)
+	}
+	if err := verdict.RecomputeRepo(ctx, s, id); err != nil {
+		t.Fatal(err)
+	}
+	v, _ = s.ResolveVerdict(ctx, id)
+	if v.RepoBlocked || len(v.HiddenRefs) != 1 || v.HiddenRefs[0] != "refs/heads/suspect" {
+		t.Fatalf("ResolveVerdict = %+v, want only refs/heads/suspect hidden", v)
+	}
+}

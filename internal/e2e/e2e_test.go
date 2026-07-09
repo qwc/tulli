@@ -348,6 +348,55 @@ func TestE2E_ScanQuarantineAndOverrideLift(t *testing.T) {
 	}
 }
 
+// TestE2E_ManualBlockQuarantinesAndLifts drives verdict-provenance (Option B)
+// end to end: a human blocks a ref (no scanner finding), the reconcile sweep
+// materialises it into a QUARANTINED verdict and hides the ref, and a later lift
+// re-advertises it. Unlike a fingerprint override this block has nothing to key
+// on but a human decision — the case the manual_blocks input exists for.
+func TestE2E_ManualBlockQuarantinesAndLifts(t *testing.T) {
+	up := t.TempDir()
+	repo := filepath.Join(up, "example.com/acme/widget")
+	makeUpstream(t, repo, "clean main\n")
+	makeUpstreamBranch(t, repo, "evil", "nothing a scanner would catch\n")
+	s := newStack(t, "file://"+up, noopScanner{})
+	base := "file://" + up
+	url := s.ts.URL + "/repos/example.com/acme/widget"
+
+	// Register the repo (both refs present, nothing blocked yet).
+	if refs := lsRemote(t, url); !refs["refs/heads/evil"] || !refs["refs/heads/main"] {
+		t.Fatalf("expected both refs advertised, got %v", refs)
+	}
+	ref := git.RepoRef{Host: "example.com", Path: "acme/widget"}
+	id, ok := s.st.RepoID(ref.UpstreamURL(base))
+	if !ok {
+		t.Fatal("repo not registered")
+	}
+
+	// A human blocks the ref; the sweep materialises + reconciles it to disk.
+	if err := s.st.InsertManualBlock(context.Background(), id, "refs/heads/evil", true, "suspected malware", "itsec"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconciler.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if refs := lsRemote(t, url); refs["refs/heads/evil"] {
+		t.Errorf("manually blocked ref must be hidden; got %v", refs)
+	} else if !refs["refs/heads/main"] {
+		t.Errorf("clean ref main must stay advertised; got %v", refs)
+	}
+
+	// The human lifts the block; the next sweep re-advertises the ref.
+	if err := s.st.InsertManualBlock(context.Background(), id, "refs/heads/evil", false, "cleared after review", "itsec"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconciler.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if refs := lsRemote(t, url); !refs["refs/heads/evil"] {
+		t.Fatalf("lifting the block should re-advertise the ref; got %v", refs)
+	}
+}
+
 // waitRefGone polls the advertisement until ref disappears or timeout (the
 // retro-quarantine is eventually-consistent — the scan runs off-request).
 func waitRefGone(t *testing.T, url, ref string, timeout time.Duration) {

@@ -10,6 +10,31 @@ import (
 	"net/netip"
 )
 
+const activeManualBlock = `-- name: ActiveManualBlock :one
+SELECT active, reason FROM manual_blocks
+WHERE repo_id = $1 AND ref IS NOT DISTINCT FROM $2
+ORDER BY created_at DESC LIMIT 1
+`
+
+type ActiveManualBlockParams struct {
+	RepoID int64
+	Ref    *string
+}
+
+type ActiveManualBlockRow struct {
+	Active bool
+	Reason string
+}
+
+// Latest human block/lift for a (repo, ref); IS NOT DISTINCT FROM matches
+// NULL=NULL so a repo-wide ($2 = NULL) lookup finds the repo-wide row.
+func (q *Queries) ActiveManualBlock(ctx context.Context, arg ActiveManualBlockParams) (ActiveManualBlockRow, error) {
+	row := q.db.QueryRow(ctx, activeManualBlock, arg.RepoID, arg.Ref)
+	var i ActiveManualBlockRow
+	err := row.Scan(&i.Active, &i.Reason)
+	return i, err
+}
+
 const affectedRefs = `-- name: AffectedRefs :many
 SELECT DISTINCT ref FROM findings WHERE repo_id = $1 AND ref IS NOT NULL
 `
@@ -204,6 +229,30 @@ func (q *Queries) InsertFinding(ctx context.Context, arg InsertFindingParams) er
 	return err
 }
 
+const insertManualBlock = `-- name: InsertManualBlock :exec
+INSERT INTO manual_blocks (repo_id, ref, active, reason, actor)
+VALUES ($1, $5, $2, $3, $4)
+`
+
+type InsertManualBlockParams struct {
+	RepoID int64
+	Active bool
+	Reason string
+	Actor  string
+	Ref    *string
+}
+
+func (q *Queries) InsertManualBlock(ctx context.Context, arg InsertManualBlockParams) error {
+	_, err := q.db.Exec(ctx, insertManualBlock,
+		arg.RepoID,
+		arg.Active,
+		arg.Reason,
+		arg.Actor,
+		arg.Ref,
+	)
+	return err
+}
+
 const insertOverride = `-- name: InsertOverride :exec
 INSERT INTO overrides (repo_id, ref, fingerprint, reason, actor)
 VALUES ($1, $5, $2, $3, $4)
@@ -297,6 +346,32 @@ func (q *Queries) ListRepos(ctx context.Context) ([]ListReposRow, error) {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const manualBlockRefs = `-- name: ManualBlockRefs :many
+SELECT DISTINCT ref FROM manual_blocks WHERE repo_id = $1
+`
+
+// Every ref (incl. NULL/repo-wide) that has any manual-block row, so recompute
+// revisits a just-lifted ref to clear its stale verdict.
+func (q *Queries) ManualBlockRefs(ctx context.Context, repoID int64) ([]*string, error) {
+	rows, err := q.db.Query(ctx, manualBlockRefs, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*string
+	for rows.Next() {
+		var ref *string
+		if err := rows.Scan(&ref); err != nil {
+			return nil, err
+		}
+		items = append(items, ref)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

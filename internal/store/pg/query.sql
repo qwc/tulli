@@ -37,6 +37,22 @@ SELECT fingerprint FROM overrides WHERE repo_id = $1 AND (ref IS NULL OR ref = $
 INSERT INTO overrides (repo_id, ref, fingerprint, reason, actor)
 VALUES ($1, sqlc.narg('ref'), $2, $3, $4);
 
+-- name: InsertManualBlock :exec
+INSERT INTO manual_blocks (repo_id, ref, active, reason, actor)
+VALUES ($1, sqlc.narg('ref'), $2, $3, $4);
+
+-- name: ActiveManualBlock :one
+-- Latest human block/lift for a (repo, ref); IS NOT DISTINCT FROM matches
+-- NULL=NULL so a repo-wide ($2 = NULL) lookup finds the repo-wide row.
+SELECT active, reason FROM manual_blocks
+WHERE repo_id = $1 AND ref IS NOT DISTINCT FROM sqlc.narg('ref')
+ORDER BY created_at DESC LIMIT 1;
+
+-- name: ManualBlockRefs :many
+-- Every ref (incl. NULL/repo-wide) that has any manual-block row, so recompute
+-- revisits a just-lifted ref to clear its stale verdict.
+SELECT DISTINCT ref FROM manual_blocks WHERE repo_id = $1;
+
 -- name: InsertVerdict :exec
 INSERT INTO verdicts (repo_id, ref, decision, reason)
 VALUES ($1, sqlc.narg('ref'), $2, sqlc.narg('reason'));

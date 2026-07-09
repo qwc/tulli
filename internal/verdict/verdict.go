@@ -5,7 +5,10 @@
 // there is one place the rules live regardless of who writes the DB.
 package verdict
 
-import "context"
+import (
+	"context"
+	"sort"
+)
 
 // Decisions written to the verdicts table (spec §9 CHECK).
 const (
@@ -33,11 +36,32 @@ type Finding struct {
 	Description string
 }
 
+// ManualBlock is a human quarantine decision that is not derived from any
+// finding (spec §6.6 / verdict-provenance Option B): the repo-wide "toxic" block
+// or a human blocking a ref the scanners deem clean. It is an INPUT to Resolve,
+// stored in the manual_blocks table, and joins the blocking set as an element no
+// fingerprint override can clear (§11.4). Active is the latest recorded state
+// (a lift sets it false); Reason is the human's rationale.
+type ManualBlock struct {
+	Active bool
+	Reason string
+}
+
 // Resolve applies the blocking set (spec §6.7): a ref is QUARANTINED iff some
-// HIGH finding on it is still applicable AND not waived by an override; otherwise
-// CLEAN. Overrides are keyed by the stable gitleaks Fingerprint (§8.1). Returns
-// the decision and a short human reason for the block message.
-func Resolve(findings []Finding, overridden map[string]bool) (decision, reason string) {
+// HIGH finding on it is still applicable AND not waived by an override, OR a
+// human has manually blocked it; otherwise CLEAN. Overrides are keyed by the
+// stable gitleaks Fingerprint (§8.1). Returns the decision and a short human
+// reason for the block message.
+func Resolve(findings []Finding, overridden map[string]bool, block ManualBlock) (decision, reason string) {
+	// A manual block is an element of the blocking set that no fingerprint
+	// override can clear; the human's reason leads the message.
+	if block.Active {
+		if block.Reason != "" {
+			return DecisionQuarantined, block.Reason
+		}
+		return DecisionQuarantined, "manually quarantined"
+	}
+
 	blocking := 0
 	for _, f := range findings {
 		if f.Severity != SeverityHigh {
@@ -94,6 +118,13 @@ type Store interface {
 	FindingsForRef(ctx context.Context, repoID int64, ref string) ([]Finding, error)
 	OverriddenFingerprints(ctx context.Context, repoID int64, ref string) ([]string, error)
 	AffectedRefs(ctx context.Context, repoID int64) ([]string, error)
+	// ActiveManualBlock reports the latest human block state for (repo, ref) —
+	// ref "" is the repo-wide block. (false, "") when none.
+	ActiveManualBlock(ctx context.Context, repoID int64, ref string) (active bool, reason string, err error)
+	// ManualBlockRefs lists every ref (incl. "" for repo-wide) that has any
+	// manual-block row, so recompute revisits a just-lifted ref to clear its
+	// stale verdict — the mirror of AffectedRefs for the human-intent input.
+	ManualBlockRefs(ctx context.Context, repoID int64) ([]string, error)
 	CurrentDecision(ctx context.Context, repoID int64, ref string) (string, error)
 	InsertVerdict(ctx context.Context, repoID int64, ref, decision, reason string) error
 }
@@ -115,21 +146,41 @@ func RecomputeRef(ctx context.Context, s Store, repoID int64, ref string) (strin
 	for _, fp := range ov {
 		set[fp] = true
 	}
-	decision, reason := Resolve(findings, set)
+	active, breason, err := s.ActiveManualBlock(ctx, repoID, ref)
+	if err != nil {
+		return "", err
+	}
+	decision, reason := Resolve(findings, set, ManualBlock{Active: active, Reason: breason})
 	return decision, writeIfChanged(ctx, s, repoID, ref, decision, reason)
 }
 
-// RecomputeRepo recomputes every ref that has findings for the repo (the demand
-// set the scan produced). A repo with no findings gets a repo-wide CLEAN baseline
-// so a scanned-clean repo reads as CLEAN (spec §12 step 1).
+// RecomputeRepo recomputes the verdict for every ref that could be blocked: those
+// with findings (the demand set the scan produced) and those with a manual block,
+// plus the repo-wide "" baseline (so a repo-wide block materialises and a
+// scanned-clean repo reads as CLEAN, spec §12 step 1). Revisiting manual-block
+// refs even after a lift is what clears a stale QUARANTINED when a human unblocks.
 func RecomputeRepo(ctx context.Context, s Store, repoID int64) error {
-	refs, err := s.AffectedRefs(ctx, repoID)
+	refSet := map[string]struct{}{"": {}} // always compute the repo-wide baseline
+	findingRefs, err := s.AffectedRefs(ctx, repoID)
 	if err != nil {
 		return err
 	}
-	if len(refs) == 0 {
-		return writeIfChanged(ctx, s, repoID, "", DecisionClean, "")
+	for _, r := range findingRefs {
+		refSet[r] = struct{}{}
 	}
+	blockRefs, err := s.ManualBlockRefs(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	for _, r := range blockRefs {
+		refSet[r] = struct{}{}
+	}
+
+	refs := make([]string, 0, len(refSet))
+	for r := range refSet {
+		refs = append(refs, r)
+	}
+	sort.Strings(refs) // deterministic order for tests/reconcile
 	for _, ref := range refs {
 		if _, err := RecomputeRef(ctx, s, repoID, ref); err != nil {
 			return err

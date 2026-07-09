@@ -21,9 +21,10 @@ type Mem struct {
 	next      int64
 	nextScan  int64
 	events    []core.Access
-	verdicts  map[int64][]memVerdict  // repo_id -> verdicts, newest last
-	findings  map[int64][]memFinding  // repo_id -> findings
-	overrides map[int64][]memOverride // repo_id -> overrides
+	verdicts  map[int64][]memVerdict     // repo_id -> verdicts, newest last
+	findings  map[int64][]memFinding     // repo_id -> findings
+	overrides map[int64][]memOverride    // repo_id -> overrides
+	blocks    map[int64][]memManualBlock // repo_id -> manual blocks, newest last
 }
 
 // memVerdict mirrors a row of the verdicts table (spec §9). ref == "" is a
@@ -44,6 +45,14 @@ type memOverride struct {
 	fingerprint string
 }
 
+// memManualBlock mirrors a manual_blocks row (verdict-provenance Option B). ref
+// "" is a repo-wide block; newest row per ref is the current state.
+type memManualBlock struct {
+	ref    string
+	active bool
+	reason string
+}
+
 func NewMem() *Mem {
 	return &Mem{
 		repos:     make(map[string]int64),
@@ -51,6 +60,7 @@ func NewMem() *Mem {
 		verdicts:  make(map[int64][]memVerdict),
 		findings:  make(map[int64][]memFinding),
 		overrides: make(map[int64][]memOverride),
+		blocks:    make(map[int64][]memManualBlock),
 	}
 }
 
@@ -207,6 +217,46 @@ func (m *Mem) InsertOverride(_ context.Context, repoID int64, ref, fingerprint, 
 	defer m.mu.Unlock()
 	m.overrides[repoID] = append(m.overrides[repoID], memOverride{ref: ref, fingerprint: fingerprint})
 	return nil
+}
+
+// InsertManualBlock records a human block/lift (verdict-provenance Option B),
+// most-recent-wins (appends). ref "" is repo-wide. The real writer is the future
+// web API; this is also the test seam.
+func (m *Mem) InsertManualBlock(_ context.Context, repoID int64, ref string, active bool, reason, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blocks[repoID] = append(m.blocks[repoID], memManualBlock{ref: ref, active: active, reason: reason})
+	return nil
+}
+
+// ActiveManualBlock returns the newest manual-block state for (repo, ref).
+func (m *Mem) ActiveManualBlock(_ context.Context, repoID int64, ref string) (bool, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows := m.blocks[repoID]
+	for i := len(rows) - 1; i >= 0; i-- {
+		if rows[i].ref == ref {
+			return rows[i].active, rows[i].reason, nil
+		}
+	}
+	return false, "", nil
+}
+
+// ManualBlockRefs returns every ref (incl. "" for repo-wide) that has any
+// manual-block row, so recompute revisits a lifted ref to clear its verdict.
+func (m *Mem) ManualBlockRefs(_ context.Context, repoID int64) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, b := range m.blocks[repoID] {
+		if !seen[b.ref] {
+			seen[b.ref] = true
+			out = append(out, b.ref)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // Events returns a copy of the recorded access events (for tests/inspection).
