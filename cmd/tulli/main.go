@@ -22,6 +22,7 @@ import (
 	"codeberg.org/qwc/tulli/internal/httpsrv"
 	"codeberg.org/qwc/tulli/internal/mirror"
 	"codeberg.org/qwc/tulli/internal/scan"
+	"codeberg.org/qwc/tulli/internal/sshsrv"
 	"codeberg.org/qwc/tulli/internal/store"
 	"codeberg.org/qwc/tulli/internal/store/pg"
 )
@@ -53,7 +54,8 @@ func envDuration(key string, def time.Duration) time.Duration {
 }
 
 func main() {
-	addr := flag.String("addr", envOr("TULLI_ADDR", ":8080"), "listen address")
+	addr := flag.String("addr", envOr("TULLI_ADDR", ":8080"), "HTTP listen address")
+	sshAddr := flag.String("ssh-addr", envOr("TULLI_SSH_ADDR", ""), "SSH listen address (e.g. :2222); empty disables the SSH door")
 	data := flag.String("data", envOr("TULLI_DATA", "./data"), "data dir (mirrors live in <data>/mirrors)")
 	upstreamBase := flag.String("upstream-base", envOr("TULLI_UPSTREAM_BASE", "https://"),
 		"upstream base: a bare scheme like https:// (default) or a URL prefix for file:// fixtures")
@@ -105,8 +107,26 @@ func main() {
 	go reconciler.Run(ctx, *reconcile)
 
 	gate := core.New(m, st, worker, log)
-	srv := httpsrv.New(gate, httpBackend, log)
 
+	// SSH door (second transport onto the same hallway). Optional: only when an
+	// address is configured. Anonymous in this stage (see internal/sshsrv).
+	if *sshAddr != "" {
+		hostKey, err := sshsrv.LoadOrCreateHostKey(filepath.Join(*data, "ssh_host_ed25519_key"))
+		if err != nil {
+			log.Error("ssh host key unavailable", "err", err)
+			os.Exit(1)
+		}
+		ssrv := sshsrv.New(gate, hostKey, log)
+		go func() {
+			log.Info("tulli ssh listening", "addr", *sshAddr)
+			if err := ssrv.ListenAndServe(ctx, *sshAddr); err != nil {
+				log.Error("ssh server exited", "err", err)
+				os.Exit(1)
+			}
+		}()
+	}
+
+	srv := httpsrv.New(gate, httpBackend, log)
 	log.Info("tulli listening", "addr", *addr, "mirrors", mirrorRoot, "upstreamBase", *upstreamBase, "store", storeKind)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Error("server exited", "err", err)

@@ -80,16 +80,59 @@ func ParseRequest(urlPath string) (ref RepoRef, verb string, err error) {
 		return ref, "", ErrUnsupported
 	}
 
+	ref, err = refFromPath(repoPart)
+	return ref, verb, err
+}
+
+// ParseSSHCommand parses the exec command a git SSH client sends, e.g.
+//
+//	git-upload-pack '/github.com/owner/repo'
+//	git-upload-pack /github.com/owner/repo.git
+//
+// into the RepoRef and verb. Unlike the HTTP path there is no /repos/ prefix and
+// no verb suffix — the command name *is* the verb. tulli is read-only, so
+// git-receive-pack is recognised only to be refused (ErrUnsupported for anything
+// that is not a git upload/receive-pack command, e.g. an interactive shell).
+func ParseSSHCommand(cmd string) (ref RepoRef, verb string, err error) {
+	prog, arg, ok := strings.Cut(strings.TrimSpace(cmd), " ")
+	if !ok {
+		return ref, "", ErrUnsupported // bare command with no repo argument
+	}
+	switch prog {
+	case VerbUploadPack, VerbReceivePack:
+		verb = prog
+	default:
+		return ref, "", ErrUnsupported
+	}
+
+	// The repo argument is shell-quoted by git (single quotes). Strip one layer of
+	// surrounding single/double quotes, then normalise the leading slash and an
+	// optional .git suffix so both forms above resolve to the same mirror.
+	p := strings.TrimSpace(arg)
+	if len(p) >= 2 && (p[0] == '\'' || p[0] == '"') && p[len(p)-1] == p[0] {
+		p = p[1 : len(p)-1]
+	}
+	p = strings.TrimPrefix(p, "/")
+	p = strings.TrimSuffix(p, ".git")
+
+	ref, err = refFromPath(p)
+	return ref, verb, err
+}
+
+// refFromPath turns a "<host>/<path...>" segment string into a validated
+// RepoRef, rejecting empty/traversal segments and paths without at least a host
+// plus one path segment. Shared by the HTTP and SSH parsers.
+func refFromPath(repoPart string) (ref RepoRef, err error) {
 	segs := strings.Split(repoPart, "/")
 	if len(segs) < 2 { // need at least host + one path segment
-		return ref, "", ErrBadRepo
+		return ref, ErrBadRepo
 	}
 	for _, s := range segs {
 		if s == "" || s == "." || s == ".." {
-			return ref, "", ErrBadRepo
+			return ref, ErrBadRepo
 		}
 	}
 	ref.Host = segs[0]
 	ref.Path = strings.Join(segs[1:], "/")
-	return ref, verb, nil
+	return ref, nil
 }
