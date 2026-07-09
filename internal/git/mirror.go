@@ -58,31 +58,33 @@ func (m *Mirror) SetHiddenRefs(ctx context.Context, repoPath string, refs []stri
 
 // EnsurePresent returns the local bare-mirror path for ref, cloning it first if
 // absent. Safe for concurrent calls; duplicate first-fetches share one clone.
-func (m *Mirror) EnsurePresent(ctx context.Context, ref RepoRef) (string, error) {
+// created is true only for the caller whose clone materialised the mirror — the
+// single fail-open-once scan trigger (followers and cache hits get false).
+func (m *Mirror) EnsurePresent(ctx context.Context, ref RepoRef) (path string, created bool, err error) {
 	dir := ref.MirrorDir(m.root)
 	if isBareRepo(dir) {
-		return dir, nil
+		return dir, false, nil
 	}
 
 	m.mu.Lock()
 	if op, ok := m.inflight[dir]; ok {
-		// A clone for this dir is already running — wait on it.
+		// A clone for this dir is already running — wait on it (follower).
 		m.mu.Unlock()
 		select {
 		case <-op.done:
 			if op.err != nil {
-				return "", op.err
+				return "", false, op.err
 			}
-			return dir, nil
+			return dir, false, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", false, ctx.Err()
 		}
 	}
 	op := &cloneOp{done: make(chan struct{})}
 	m.inflight[dir] = op
 	m.mu.Unlock()
 
-	err := m.clone(ctx, ref, dir)
+	err = m.clone(ctx, ref, dir)
 
 	m.mu.Lock()
 	delete(m.inflight, dir)
@@ -91,9 +93,9 @@ func (m *Mirror) EnsurePresent(ctx context.Context, ref RepoRef) (string, error)
 	close(op.done)
 
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return dir, nil
+	return dir, true, nil
 }
 
 // clone materialises the mirror: it runs cloneFn into a temp dir, then

@@ -22,6 +22,12 @@ type Admission struct {
 	BlockMsg string // remote: message when !Allowed (spec §3.3)
 }
 
+// RepoInfo identifies a mirrored repo for the reconcile sweep (id + on-disk path).
+type RepoInfo struct {
+	ID         int64
+	MirrorPath string
+}
+
 // Access is one recorded fetch (spec §9 access_events). Ref/commit are left for
 // a later stage — they require reading the upload-pack negotiation, which we
 // don't yet parse.
@@ -34,11 +40,27 @@ type Access struct {
 
 // Mirror is the seam onto lazy mirroring (implemented by internal/git.Mirror).
 type Mirror interface {
-	EnsurePresent(ctx context.Context, ref git.RepoRef) (string, error)
+	// EnsurePresent returns the mirror path and whether it was just created
+	// (created == true only on the first fetch — the fail-open-once scan trigger).
+	EnsurePresent(ctx context.Context, ref git.RepoRef) (path string, created bool, err error)
 	UpstreamURL(ref git.RepoRef) string
 	// SetHiddenRefs reconciles the mirror's ref-level quarantine so upload-pack
 	// hides exactly refs (spec §6.4).
 	SetHiddenRefs(ctx context.Context, repoPath string, refs []string) error
+}
+
+// ScanRequest is a fail-open-once scan enqueued after a first fetch (spec §7).
+// Range is a git revision range to scan; "" means the whole in-window history.
+type ScanRequest struct {
+	RepoID   int64
+	RepoPath string
+	Range    string
+}
+
+// Enqueuer hands a scan to the async worker. Non-blocking from the request path
+// (implemented by internal/scan.Worker). A nil Enqueuer disables scanning.
+type Enqueuer interface {
+	Enqueue(req ScanRequest)
 }
 
 // Verdict is the gate's enforcement view of a repo, resolved most-specific-wins
@@ -64,16 +86,16 @@ type Store interface {
 	ResolveVerdict(ctx context.Context, repoID int64) (Verdict, error)
 }
 
-// Gatekeeper runs the policy pipeline. The gate (verdict resolver) slots in later
-// without changing this signature.
+// Gatekeeper runs the policy pipeline: resolve → ensure → gate → (enqueue scan).
 type Gatekeeper struct {
-	mirror Mirror
-	store  Store
-	log    *slog.Logger
+	mirror   Mirror
+	store    Store
+	enqueuer Enqueuer // may be nil (scanning disabled)
+	log      *slog.Logger
 }
 
-func New(m Mirror, s Store, log *slog.Logger) *Gatekeeper {
-	return &Gatekeeper{mirror: m, store: s, log: log}
+func New(m Mirror, s Store, enq Enqueuer, log *slog.Logger) *Gatekeeper {
+	return &Gatekeeper{mirror: m, store: s, enqueuer: enq, log: log}
 }
 
 // Admit runs resolve(done by the adapter) → ensure-mirrored → record-repo → gate.
@@ -87,7 +109,7 @@ func (g *Gatekeeper) Admit(ctx context.Context, ref git.RepoRef, verb string) (A
 		}, nil
 	}
 
-	dir, err := g.mirror.EnsurePresent(ctx, ref)
+	dir, created, err := g.mirror.EnsurePresent(ctx, ref)
 	if err != nil {
 		return Admission{}, err
 	}
@@ -127,6 +149,13 @@ func (g *Gatekeeper) Admit(ctx context.Context, ref git.RepoRef, verb string) (A
 			return Admission{Allowed: false, RepoID: repoID, Verb: verb,
 				BlockMsg: "tulli: enforcement temporarily unavailable, try again shortly"}, nil
 		}
+	}
+
+	// Fail-open-once (spec §7): the first fetch of a freshly-mirrored repo is
+	// served now and scanned asynchronously; a HIGH secret retro-quarantines it
+	// for the next fetch. Only on creation, so a warm cache never re-scans here.
+	if created && g.enqueuer != nil {
+		g.enqueuer.Enqueue(ScanRequest{RepoID: repoID, RepoPath: dir})
 	}
 
 	return Admission{Allowed: true, RepoPath: dir, RepoID: repoID, Verb: verb}, nil

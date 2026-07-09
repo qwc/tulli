@@ -15,12 +15,50 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
+	"codeberg.org/qwc/tulli/internal/mirror"
+	"codeberg.org/qwc/tulli/internal/scan"
 	"codeberg.org/qwc/tulli/internal/store"
+	"codeberg.org/qwc/tulli/internal/verdict"
 )
+
+// noopScanner finds nothing — used by the tests that aren't exercising scanning
+// (keeps their behavior deterministic without the absent gitleaks binary).
+type noopScanner struct{}
+
+func (noopScanner) Name() string                { return "noop" }
+func (noopScanner) Descriptor() scan.Descriptor { return scan.Descriptor{} }
+func (noopScanner) Scan(context.Context, scan.ScanScope) (scan.ScanResult, error) {
+	return scan.ScanResult{}, nil
+}
+
+// fakeSecretScanner stands in for gitleaks: it reports one HIGH secret on the
+// tip commit of secretRef, so the worker attributes it to that ref and
+// quarantines it — the real gitleaks path is the same, just with a real binary.
+type fakeSecretScanner struct {
+	secretRef   string
+	fingerprint string
+}
+
+func (f fakeSecretScanner) Name() string { return "gitleaks" }
+func (f fakeSecretScanner) Descriptor() scan.Descriptor {
+	return scan.Descriptor{Attribution: scan.Commit, Lane: scan.Fast}
+}
+func (f fakeSecretScanner) Scan(_ context.Context, sc scan.ScanScope) (scan.ScanResult, error) {
+	out, err := exec.Command("git", "--git-dir", sc.RepoPath, "rev-parse", f.secretRef).Output()
+	if err != nil {
+		return scan.ScanResult{}, err
+	}
+	commit := strings.TrimSpace(string(out))
+	return scan.ScanResult{Findings: []verdict.Finding{{
+		Scanner: "gitleaks", Severity: verdict.SeverityHigh, RuleID: "aws-access-key",
+		Commit: commit, Fingerprint: f.fingerprint, Description: "AWS key",
+	}}}, nil
+}
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
@@ -65,28 +103,46 @@ func makeUpstreamBranch(t *testing.T, dir, branch, seed string) {
 	run(t, work, "git", "push", "-q", "origin", branch)
 }
 
-// newStack wires the real stack and returns the test server, mirror root, and
-// the in-memory audit store (for asserting the audit trail).
-func newStack(t *testing.T, upstreamBase string) (*httptest.Server, string, *store.Mem) {
+// stack is the wired system under test.
+type stack struct {
+	ts         *httptest.Server
+	mirrors    string
+	st         *store.Mem
+	worker     *scan.Worker
+	reconciler *mirror.Reconciler
+}
+
+// newStack wires the full real stack (gate + async scan worker + reconciler)
+// behind an httptest server. The scanner is injected because gitleaks is not
+// installed in CI/dev; pass noopScanner for the non-scanning tests.
+func newStack(t *testing.T, upstreamBase string, scanner scan.Scanner) *stack {
 	t.Helper()
 	backend, err := git.NewBackend()
 	if err != nil {
 		t.Skipf("git http-backend unavailable: %v", err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
 	mirrors := filepath.Join(t.TempDir(), "mirrors")
-	mirror := git.NewMirror(mirrors, upstreamBase, discardLogger())
+	mir := git.NewMirror(mirrors, upstreamBase, discardLogger())
 	st := store.NewMem()
-	gate := core.New(mirror, st, discardLogger())
+	reconciler := mirror.NewReconciler(st, discardLogger())
+	worker := scan.NewWorker(scanner, st, git.RefsContaining, reconciler, discardLogger())
+	go worker.Run(ctx)
+
+	gate := core.New(mir, st, worker, discardLogger())
 	srv := httpsrv.New(gate, backend, discardLogger())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return ts, mirrors, st
+	return &stack{ts: ts, mirrors: mirrors, st: st, worker: worker, reconciler: reconciler}
 }
 
 func TestE2E_CloneThroughProxy(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "example.com/acme/widget"), "hello e2e\n")
-	ts, mirrors, st := newStack(t, "file://"+up)
+	s := newStack(t, "file://"+up, noopScanner{})
+	ts, mirrors, st := s.ts, s.mirrors, s.st
 
 	dst := filepath.Join(t.TempDir(), "clone")
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/example.com/acme/widget", dst)
@@ -122,7 +178,7 @@ func TestE2E_CloneThroughProxy(t *testing.T) {
 func TestE2E_CacheHitSecondClone(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "h/o/r"), "x\n")
-	ts, _, _ := newStack(t, "file://"+up)
+	ts := newStack(t, "file://"+up, noopScanner{}).ts
 
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/h/o/r", filepath.Join(t.TempDir(), "a"))
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/h/o/r", filepath.Join(t.TempDir(), "b"))
@@ -131,7 +187,7 @@ func TestE2E_CacheHitSecondClone(t *testing.T) {
 func TestE2E_ConcurrentFirstFetch(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "h/o/con"), "concurrent\n")
-	ts, _, _ := newStack(t, "file://"+up)
+	ts := newStack(t, "file://"+up, noopScanner{}).ts
 
 	base := t.TempDir()
 	const N = 4
@@ -159,7 +215,7 @@ func TestE2E_ConcurrentFirstFetch(t *testing.T) {
 func TestE2E_ReadOnlyPushRefused(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "h/o/r"), "x\n")
-	ts, _, _ := newStack(t, "file://"+up)
+	ts := newStack(t, "file://"+up, noopScanner{}).ts
 
 	dst := filepath.Join(t.TempDir(), "c")
 	run(t, "", "git", "clone", "-q", ts.URL+"/repos/h/o/r", dst)
@@ -180,7 +236,8 @@ func TestE2E_ReadOnlyPushRefused(t *testing.T) {
 func TestE2E_RepoWideQuarantineBlocksClone(t *testing.T) {
 	up := t.TempDir()
 	makeUpstream(t, filepath.Join(up, "example.com/acme/widget"), "hello\n")
-	ts, _, st := newStack(t, "file://"+up)
+	s := newStack(t, "file://"+up, noopScanner{})
+	ts, st := s.ts, s.st
 	base := "file://" + up
 
 	// First clone succeeds and registers the repo (assigning its id).
@@ -213,7 +270,8 @@ func TestE2E_RefLevelQuarantineHidesRef(t *testing.T) {
 	repo := filepath.Join(up, "example.com/acme/widget")
 	makeUpstream(t, repo, "clean main\n")
 	makeUpstreamBranch(t, repo, "evil", "leaked secret\n")
-	ts, _, st := newStack(t, "file://"+up)
+	s := newStack(t, "file://"+up, noopScanner{})
+	ts, st := s.ts, s.st
 	base := "file://" + up
 	url := ts.URL + "/repos/example.com/acme/widget"
 
@@ -240,6 +298,72 @@ func TestE2E_RefLevelQuarantineHidesRef(t *testing.T) {
 	run(t, "", "git", "clone", "-q", url, filepath.Join(t.TempDir(), "c"))
 }
 
+// TestE2E_ScanQuarantineAndOverrideLift is the stage-4 arc (spec §12 steps 2–4):
+// a first fetch is served (fail-open-once), the async scanner finds a secret on
+// the evil branch and retro-quarantines it (hidden from the advertisement while
+// main still clones), then an override on the finding's fingerprint + a reconcile
+// sweep lifts the block and the ref returns. gitleaks is stubbed by
+// fakeSecretScanner (binary absent in dev); the pipeline is otherwise real.
+func TestE2E_ScanQuarantineAndOverrideLift(t *testing.T) {
+	up := t.TempDir()
+	repo := filepath.Join(up, "example.com/acme/widget")
+	makeUpstream(t, repo, "clean main\n")
+	makeUpstreamBranch(t, repo, "evil", "AKIAIOSFODNN7EXAMPLE\n")
+
+	const fp = "fp-aws-1"
+	s := newStack(t, "file://"+up, fakeSecretScanner{secretRef: "refs/heads/evil", fingerprint: fp})
+	base := "file://" + up
+	url := s.ts.URL + "/repos/example.com/acme/widget"
+
+	// First fetch: served now (fail-open-once), and it enqueues the async scan.
+	if refs := lsRemote(t, url); !refs["refs/heads/evil"] {
+		t.Fatalf("evil should be advertised before the scan lands; got %v", refs)
+	}
+
+	// The scan runs off-request; wait for it to retro-quarantine evil.
+	waitRefGone(t, url, "refs/heads/evil", 5*time.Second)
+	if refs := lsRemote(t, url); !refs["refs/heads/main"] {
+		t.Errorf("clean ref main must stay advertised after quarantine; got %v", refs)
+	}
+	// A full clone still works — it just omits the hidden ref.
+	run(t, "", "git", "clone", "-q", url, filepath.Join(t.TempDir(), "clone-quarantined"))
+
+	// Override the finding's fingerprint (stands in for the stage-6 web API; here
+	// a direct store write, as demo.sh does via SQL) and run the reconcile sweep.
+	ref := git.RepoRef{Host: "example.com", Path: "acme/widget"}
+	id, ok := s.st.RepoID(ref.UpstreamURL(base))
+	if !ok {
+		t.Fatal("repo not registered")
+	}
+	if err := s.st.InsertOverride(context.Background(), id, "refs/heads/evil", fp, "false positive", "itsec"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconciler.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The override lifts the block: evil is advertised again and clones.
+	if refs := lsRemote(t, url); !refs["refs/heads/evil"] {
+		t.Fatalf("override should lift the quarantine and re-advertise evil; got %v", refs)
+	}
+}
+
+// waitRefGone polls the advertisement until ref disappears or timeout (the
+// retro-quarantine is eventually-consistent — the scan runs off-request).
+func waitRefGone(t *testing.T, url, ref string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if !lsRemote(t, url)[ref] {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ref %s still advertised after %s — scan/quarantine did not land", ref, timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // lsRemote returns the set of refs the proxy advertises for url.
 func lsRemote(t *testing.T, url string) map[string]bool {
 	t.Helper()
@@ -260,7 +384,8 @@ func TestE2E_GitHubCloneThroughProxy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping network test in -short")
 	}
-	ts, mirrors, _ := newStack(t, "https://")
+	s := newStack(t, "https://", noopScanner{})
+	ts, mirrors := s.ts, s.mirrors
 
 	dst := filepath.Join(t.TempDir(), "gh")
 	cmd := exec.CommandContext(context.Background(), "git", "clone", "-q",

@@ -10,15 +10,20 @@ import (
 	"sync"
 
 	"codeberg.org/qwc/tulli/internal/core"
+	"codeberg.org/qwc/tulli/internal/verdict"
 )
 
 // Mem is a thread-safe, non-persistent core.Store. Audit data is lost on restart.
 type Mem struct {
-	mu       sync.Mutex
-	repos    map[string]int64 // upstream_url -> id
-	next     int64
-	events   []core.Access
-	verdicts map[int64][]memVerdict // repo_id -> verdicts, newest last
+	mu        sync.Mutex
+	repos     map[string]int64 // upstream_url -> id
+	paths     map[int64]string // repo_id -> mirror_path
+	next      int64
+	nextScan  int64
+	events    []core.Access
+	verdicts  map[int64][]memVerdict  // repo_id -> verdicts, newest last
+	findings  map[int64][]memFinding  // repo_id -> findings
+	overrides map[int64][]memOverride // repo_id -> overrides
 }
 
 // memVerdict mirrors a row of the verdicts table (spec §9). ref == "" is a
@@ -29,18 +34,36 @@ type memVerdict struct {
 	reason   string
 }
 
-func NewMem() *Mem {
-	return &Mem{repos: make(map[string]int64), verdicts: make(map[int64][]memVerdict)}
+type memFinding struct {
+	ref string
+	f   verdict.Finding
 }
 
-func (m *Mem) UpsertRepo(_ context.Context, upstreamURL, _ string) (int64, error) {
+type memOverride struct {
+	ref         string // "" = repo-wide
+	fingerprint string
+}
+
+func NewMem() *Mem {
+	return &Mem{
+		repos:     make(map[string]int64),
+		paths:     make(map[int64]string),
+		verdicts:  make(map[int64][]memVerdict),
+		findings:  make(map[int64][]memFinding),
+		overrides: make(map[int64][]memOverride),
+	}
+}
+
+func (m *Mem) UpsertRepo(_ context.Context, upstreamURL, mirrorPath string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if id, ok := m.repos[upstreamURL]; ok {
+		m.paths[id] = mirrorPath
 		return id, nil
 	}
 	m.next++
 	m.repos[upstreamURL] = m.next
+	m.paths[m.next] = mirrorPath
 	return m.next, nil
 }
 
@@ -90,6 +113,100 @@ func (m *Mem) ResolveVerdict(_ context.Context, repoID int64) (core.Verdict, err
 	}
 	sort.Strings(v.HiddenRefs) // deterministic for tests/reconcile
 	return v, nil
+}
+
+// InsertVerdict is the real writer (scan worker / recompute); appends most-recent.
+func (m *Mem) InsertVerdict(_ context.Context, repoID int64, ref, decision, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.verdicts[repoID] = append(m.verdicts[repoID], memVerdict{ref: ref, decision: decision, reason: reason})
+	return nil
+}
+
+// CurrentDecision returns the newest verdict decision for (repo, ref), or "".
+func (m *Mem) CurrentDecision(_ context.Context, repoID int64, ref string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows := m.verdicts[repoID]
+	for i := len(rows) - 1; i >= 0; i-- {
+		if rows[i].ref == ref {
+			return rows[i].decision, nil
+		}
+	}
+	return "", nil
+}
+
+// --- Stage 4: scan results, verdict recompute inputs, reconcile inputs ---
+
+func (m *Mem) ListRepos(_ context.Context) ([]core.RepoInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]core.RepoInfo, 0, len(m.paths))
+	for id, path := range m.paths {
+		out = append(out, core.RepoInfo{ID: id, MirrorPath: path})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *Mem) InsertScan(_ context.Context, _ int64, _, _, _ string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextScan++
+	return m.nextScan, nil
+}
+
+func (m *Mem) InsertFinding(_ context.Context, _, repoID int64, ref string, f verdict.Finding) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.findings[repoID] = append(m.findings[repoID], memFinding{ref: ref, f: f})
+	return nil
+}
+
+func (m *Mem) FindingsForRef(_ context.Context, repoID int64, ref string) ([]verdict.Finding, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []verdict.Finding
+	for _, mf := range m.findings[repoID] {
+		if mf.ref == ref {
+			out = append(out, mf.f)
+		}
+	}
+	return out, nil
+}
+
+func (m *Mem) AffectedRefs(_ context.Context, repoID int64) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, mf := range m.findings[repoID] {
+		if mf.ref != "" && !seen[mf.ref] {
+			seen[mf.ref] = true
+			out = append(out, mf.ref)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (m *Mem) OverriddenFingerprints(_ context.Context, repoID int64, ref string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, o := range m.overrides[repoID] {
+		if o.ref == "" || o.ref == ref { // repo-wide or ref-scoped (spec §6.7)
+			out = append(out, o.fingerprint)
+		}
+	}
+	return out, nil
+}
+
+func (m *Mem) InsertOverride(_ context.Context, repoID int64, ref, fingerprint, _, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.overrides[repoID] = append(m.overrides[repoID], memOverride{ref: ref, fingerprint: fingerprint})
+	return nil
 }
 
 // Events returns a copy of the recorded access events (for tests/inspection).

@@ -131,12 +131,30 @@ mirror-owning process can do that. So:
   triage rows and runs the *pure* blocking-set recompute (spec §6.7) → all DB, no
   filesystem.
 - **Reconciler** (in `internal/mirror`, mirror-owning process) makes on-disk git
-  config match the DB — applies/removes `hideRefs` per current verdicts. Runs on
-  change *and* on boot (reconcile-all → restarts self-heal).
+  config match the DB — applies/removes `hideRefs` per current verdicts.
+  **Cadence (resolved):** event-driven on *in-process* verdict writes (the scan
+  worker) **+ a periodic safety sweep** over demand-active `(repo, ref)`. The
+  sweep is what catches verdicts written *out of process* — which is exactly how
+  the future web API writes them — so the DB-as-desired-state model self-heals
+  regardless of writer. Boot runs one sweep (restarts self-heal).
 
 Rule: **`internal/web` touches only the DB and the enqueue/intent path — never
 the mirror filesystem, never core functions directly.** This is what makes the
 separate-exec split free.
+
+**Administration goes through the web API — decided, and it constrains the CLI.**
+The credential surface forces this: the enforcement writer must hold DB creds,
+and we will not (a) distribute a write-capable DB credential to an operator CLI,
+nor (b) stand up a second admin surface (HTTP or unix socket) on the git-serving
+process. So the **web frontend is the single writer for human intents** (override
+/ manual-quarantine / triage), holds the DB creds, and lives alongside the proxy.
+Any `tullictl` is a **client of that web API** (bearer token, never DB creds) —
+the kubectl→apiserver→etcd shape. Consequence: **the real operator CLI cannot
+precede the web API**, so it is a **stage-6 artifact**, not stage 4. Stage 4
+therefore ships **no operator CLI**; its §12 step-4 override is actuated by a
+documented `demo.sh` scaffold (direct `INSERT INTO overrides …`, explicitly a
+stand-in for the stage-6 web API), and the periodic reconcile sweep picks up the
+out-of-process write — the very path the web API will use.
 
 ---
 
@@ -165,10 +183,18 @@ Each stage is a testable vertical slice.
    real schema locally. `internal/store.Mem` stays as the fast unit-test fake.
    Deps are vendored (read-only module cache). Verified: full §9 DDL applies on
    real PG; upsert idempotent; audit row persists.
-3. **Gate + block message.** Manually-inserted quarantine verdict → `ERR`
-   pkt-line blocks; clean ref still serves. Core of the §12 demo.
+3. ✅ **DONE (2026-07-09, HEAD=4175bcc).** Gate + block message. `ResolveVerdict`
+   most-specific-wins resolver over `verdicts`; repo-wide QUARANTINED → `ERR`
+   pkt-line at info/refs (HTTP **200** — a 403 makes git drop our message);
+   ref-level QUARANTINED → `uploadpack.hideRefs` reconcile (fail-closed if it
+   can't hide). Tested against real git + real PG.
 4. **gitleaks worker + fail-open-once + retro-quarantine + reconciler.** Full
-   secret-quarantine flow (§12 steps 1–4). Reconciler applies `hideRefs`.
+   secret-quarantine flow (§12 steps 1–4). **Mechanism only — no operator CLI**
+   (§4: the real actuator is the stage-6 web API). Pieces:
+   `internal/verdict` (blocking-set recompute, spec §6.7), `internal/scan`
+   (Scanner seam + gitleaks adapter + in-memory Enqueuer + async worker),
+   `internal/mirror` (reconciler: event + periodic sweep). §12 step-4 override is
+   a documented `demo.sh` SQL scaffold. gitleaks-only; Trivy/SBOM/CVE → stage 6.
 5. **SSH transport** (second door, same hallway).
 6. **Identity/self-service, Trivy+SBOM, triage web UI** — order TBD.
 

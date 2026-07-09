@@ -16,6 +16,7 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 
 type fakeMirror struct {
 	dir       string
+	created   bool
 	err       error
 	calls     int32
 	hidden    []string // last refs passed to SetHiddenRefs
@@ -23,9 +24,9 @@ type fakeMirror struct {
 	hideErr   error
 }
 
-func (f *fakeMirror) EnsurePresent(_ context.Context, _ git.RepoRef) (string, error) {
+func (f *fakeMirror) EnsurePresent(_ context.Context, _ git.RepoRef) (string, bool, error) {
 	atomic.AddInt32(&f.calls, 1)
-	return f.dir, f.err
+	return f.dir, f.created, f.err
 }
 func (f *fakeMirror) UpstreamURL(ref git.RepoRef) string { return "https://" + ref.String() }
 func (f *fakeMirror) SetHiddenRefs(_ context.Context, _ string, refs []string) error {
@@ -58,10 +59,14 @@ func (f *fakeStore) ResolveVerdict(_ context.Context, _ int64) (Verdict, error) 
 	return f.verdict, f.verdErr
 }
 
+type fakeEnqueuer struct{ reqs []ScanRequest }
+
+func (f *fakeEnqueuer) Enqueue(r ScanRequest) { f.reqs = append(f.reqs, r) }
+
 func TestAdmit_UploadPackAllowedAndRecordsRepo(t *testing.T) {
 	fm := &fakeMirror{dir: "/mirrors/github.com/o/r.git"}
 	fs := &fakeStore{repoID: 7}
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "github.com", Path: "o/r"}, git.VerbUploadPack)
 	if err != nil {
@@ -81,7 +86,7 @@ func TestAdmit_UploadPackAllowedAndRecordsRepo(t *testing.T) {
 func TestAdmit_ReceivePackRefused(t *testing.T) {
 	fm := &fakeMirror{dir: "unused"}
 	fs := &fakeStore{}
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbReceivePack)
 	if err != nil {
@@ -99,7 +104,7 @@ func TestAdmit_ReceivePackRefused(t *testing.T) {
 }
 
 func TestAdmit_MirrorErrorPropagates(t *testing.T) {
-	g := New(&fakeMirror{err: errors.New("upstream gone")}, &fakeStore{}, discardLogger())
+	g := New(&fakeMirror{err: errors.New("upstream gone")}, &fakeStore{}, nil, discardLogger())
 	if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err == nil {
 		t.Fatal("want mirror error propagated")
 	}
@@ -109,7 +114,7 @@ func TestAdmit_MirrorErrorPropagates(t *testing.T) {
 func TestAdmit_StoreErrorStillServes(t *testing.T) {
 	fm := &fakeMirror{dir: "/m/x.git"}
 	fs := &fakeStore{upErr: errors.New("db down")}
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
 	if err != nil {
@@ -126,7 +131,7 @@ func TestAdmit_StoreErrorStillServes(t *testing.T) {
 func TestAdmit_RepoWideQuarantineBlocks(t *testing.T) {
 	fm := &fakeMirror{dir: "/m/x.git"}
 	fs := &fakeStore{repoID: 7, verdict: Verdict{RepoBlocked: true, Reason: "3 HIGH secrets (gitleaks)"}}
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
 	if err != nil {
@@ -149,7 +154,7 @@ func TestAdmit_RepoWideQuarantineBlocks(t *testing.T) {
 func TestAdmit_RefLevelQuarantineHidesAndServes(t *testing.T) {
 	fm := &fakeMirror{dir: "/m/x.git"}
 	fs := &fakeStore{repoID: 7, verdict: Verdict{HiddenRefs: []string{"refs/heads/evil", "refs/tags/bad"}}}
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
 	if err != nil {
@@ -170,7 +175,7 @@ func TestAdmit_RefLevelQuarantineHidesAndServes(t *testing.T) {
 func TestAdmit_HideRefsFailureFailsClosed(t *testing.T) {
 	fm := &fakeMirror{dir: "/m/x.git", hideErr: errors.New("git config broke")}
 	fs := &fakeStore{repoID: 7, verdict: Verdict{HiddenRefs: []string{"refs/heads/evil"}}}
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
 	if err != nil {
@@ -185,7 +190,7 @@ func TestAdmit_HideRefsFailureFailsClosed(t *testing.T) {
 func TestAdmit_VerdictErrorFailsOpen(t *testing.T) {
 	fm := &fakeMirror{dir: "/m/x.git"}
 	fs := &fakeStore{repoID: 7, verdErr: errors.New("db hiccup")}
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
 	if err != nil {
@@ -199,7 +204,7 @@ func TestAdmit_VerdictErrorFailsOpen(t *testing.T) {
 func TestAdmit_CleanServesWithoutHiding(t *testing.T) {
 	fm := &fakeMirror{dir: "/m/x.git"}
 	fs := &fakeStore{repoID: 7} // zero-value Verdict = clean
-	g := New(fm, fs, discardLogger())
+	g := New(fm, fs, nil, discardLogger())
 
 	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs)
 	if err != nil {
@@ -213,9 +218,45 @@ func TestAdmit_CleanServesWithoutHiding(t *testing.T) {
 	}
 }
 
+// Fail-open-once: a freshly-created mirror triggers exactly one async scan; a
+// warm-cache hit (created == false) triggers none.
+func TestAdmit_EnqueuesScanOnlyOnCreate(t *testing.T) {
+	t.Run("created", func(t *testing.T) {
+		enq := &fakeEnqueuer{}
+		g := New(&fakeMirror{dir: "/m/x.git", created: true}, &fakeStore{repoID: 7}, enq, discardLogger())
+		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err != nil {
+			t.Fatal(err)
+		}
+		if len(enq.reqs) != 1 || enq.reqs[0].RepoID != 7 || enq.reqs[0].RepoPath != "/m/x.git" {
+			t.Fatalf("enqueued = %+v, want one scan of repo 7", enq.reqs)
+		}
+	})
+	t.Run("cache hit", func(t *testing.T) {
+		enq := &fakeEnqueuer{}
+		g := New(&fakeMirror{dir: "/m/x.git", created: false}, &fakeStore{repoID: 7}, enq, discardLogger())
+		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err != nil {
+			t.Fatal(err)
+		}
+		if len(enq.reqs) != 0 {
+			t.Fatalf("cache hit must not enqueue a scan; got %+v", enq.reqs)
+		}
+	})
+	t.Run("quarantined repo does not enqueue", func(t *testing.T) {
+		enq := &fakeEnqueuer{}
+		fs := &fakeStore{repoID: 7, verdict: Verdict{RepoBlocked: true}}
+		g := New(&fakeMirror{dir: "/m/x.git", created: true}, fs, enq, discardLogger())
+		if _, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbInfoRefs); err != nil {
+			t.Fatal(err)
+		}
+		if len(enq.reqs) != 0 {
+			t.Fatalf("a blocked repo should not enqueue a fetch-triggered scan; got %+v", enq.reqs)
+		}
+	})
+}
+
 func TestFinishAudit_RecordsEvent(t *testing.T) {
 	fs := &fakeStore{}
-	g := New(&fakeMirror{}, fs, discardLogger())
+	g := New(&fakeMirror{}, fs, nil, discardLogger())
 	g.FinishAudit(context.Background(), Access{RepoID: 7, SourceIP: "1.2.3.4", Status: 200, Bytes: 42})
 	if len(fs.events) != 1 || fs.events[0].RepoID != 7 || fs.events[0].Bytes != 42 {
 		t.Fatalf("events = %+v", fs.events)
@@ -224,7 +265,7 @@ func TestFinishAudit_RecordsEvent(t *testing.T) {
 
 func TestFinishAudit_SkipsWhenNoRepoID(t *testing.T) {
 	fs := &fakeStore{}
-	g := New(&fakeMirror{}, fs, discardLogger())
+	g := New(&fakeMirror{}, fs, nil, discardLogger())
 	g.FinishAudit(context.Background(), Access{RepoID: 0, Status: 200})
 	if len(fs.events) != 0 {
 		t.Fatalf("no event should be recorded without a repo id; got %+v", fs.events)

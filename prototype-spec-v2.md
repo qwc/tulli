@@ -180,14 +180,27 @@ Two distinct channels, mapped to two needs:
   Over SSH the equivalent is: write the message to the exec session's
   **stderr** and exit non-zero (git surfaces remote stderr as `remote:`).
 
-- **Success/info message (deferred, needs Strategy B).** The sideband (band 2,
-  the channel git's own "Counting objects…" rides) lets us prepend our own
-  lines to a successful fetch:
+- **Success/info message, incl. the hidden-refs notice (deferred, needs Strategy
+  B).** The sideband (band 2, the channel git's own "Counting objects…" rides)
+  lets us prepend our own lines to a *successful* fetch:
 
   ```
   remote: ✔ git-proxy: mirror of github.com/owner/repo, synced 5m ago
   remote: ✔ scanned 2m ago — CLEAN (gitleaks, trivy)
+  remote: ⚠ git-proxy: 1 ref hidden on this repo (QUARANTINED) — see <web>
   ```
+
+  This is where a **ref-level quarantine notice** belongs: a `hideRefs` block is
+  *silent* to the git client under Strategy A (a full clone simply omits the ref;
+  `clone -b <hidden>` gets git's own "not found"), because we can't emit a
+  per-ref `remote:` message without being inside the upload-pack stream (= driving
+  upload-pack ourselves, Strategy B). Prepending band-2 packets under Strategy A
+  (we hand off to `git http-backend`) would corrupt the response. The *reason* is
+  already stored on every verdict, so this notice — and the out-of-band "why" via
+  the **web/triage UI** — is a broadcast-only addition once Strategy B / the web
+  frontend lands, not new plumbing. **Decided:** we do **not** add any status/HTTP
+  surface to the git-serving process to carry this (that would bleed the web
+  concern onto the public git port); the notice waits for its proper channels.
 
 ---
 

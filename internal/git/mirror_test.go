@@ -54,7 +54,7 @@ func TestEnsurePresent_SingleFlight(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func(i int) {
 			defer wg.Done()
-			dirs[i], errs[i] = m.EnsurePresent(context.Background(), ref)
+			dirs[i], _, errs[i] = m.EnsurePresent(context.Background(), ref)
 		}(i)
 	}
 
@@ -98,7 +98,7 @@ func TestEnsurePresent_FollowerWaitsForLeader(t *testing.T) {
 
 	followerDone := make(chan string, 1)
 	go func() {
-		dir, err := m.EnsurePresent(context.Background(), ref)
+		dir, _, err := m.EnsurePresent(context.Background(), ref)
 		if err != nil {
 			t.Errorf("follower error: %v", err)
 		}
@@ -135,11 +135,11 @@ func TestEnsurePresent_CacheHit(t *testing.T) {
 	})
 	ref := RepoRef{Host: "h", Path: "o/r"}
 
-	if _, err := m.EnsurePresent(context.Background(), ref); err != nil {
-		t.Fatal(err)
+	if _, created, err := m.EnsurePresent(context.Background(), ref); err != nil || !created {
+		t.Fatalf("first fetch: created=%v err=%v, want created=true", created, err)
 	}
-	if _, err := m.EnsurePresent(context.Background(), ref); err != nil {
-		t.Fatal(err)
+	if _, created, err := m.EnsurePresent(context.Background(), ref); err != nil || created {
+		t.Fatalf("cache hit: created=%v err=%v, want created=false", created, err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("cloneFn called %d times across 2 calls, want 1 (cache hit)", got)
@@ -157,13 +157,13 @@ func TestEnsurePresent_RetriesAfterFailure(t *testing.T) {
 	})
 	ref := RepoRef{Host: "h", Path: "o/r"}
 
-	if _, err := m.EnsurePresent(context.Background(), ref); err == nil {
+	if _, _, err := m.EnsurePresent(context.Background(), ref); err == nil {
 		t.Fatal("expected error on first (failing) attempt")
 	}
 	if isBareRepo(ref.MirrorDir(m.root)) {
 		t.Fatal("a failed clone must not leave a mirror on disk")
 	}
-	if _, err := m.EnsurePresent(context.Background(), ref); err != nil {
+	if _, _, err := m.EnsurePresent(context.Background(), ref); err != nil {
 		t.Fatalf("second attempt should succeed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
@@ -188,7 +188,7 @@ func TestEnsurePresent_ContextCancelWhileWaiting(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	fDone := make(chan error, 1)
-	go func() { _, err := m.EnsurePresent(ctx, ref); fDone <- err }()
+	go func() { _, _, err := m.EnsurePresent(ctx, ref); fDone <- err }()
 	cancel()
 
 	select {

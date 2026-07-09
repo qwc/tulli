@@ -22,7 +22,23 @@ Early prototype, built in stages (see `IMPLEMENTATION.md` §5).
   `git-http-backend`.
 - **Stage 2 ✅** — persistence + audit: full §9 schema (goose), Postgres store
   (`pgx` + `sqlc`) recording `repos` + `access_events`. Postgres when
-  `TULLI_DATABASE_URL` is set, else an in-memory store. No gate/scan/identity yet.
+  `TULLI_DATABASE_URL` is set, else an in-memory store.
+- **Stage 3 ✅** — the gate: a repo-wide quarantine aborts the clone with an `ERR`
+  pkt-line (`remote: tulli: repo QUARANTINED — …`); a ref-level quarantine hides
+  just that ref via `uploadpack.hideRefs` while the rest of the repo still clones.
+- **Stage 4 ✅** — secret quarantine, end to end: the first fetch is served, then
+  scanned asynchronously (gitleaks, **fail-open-once**); a HIGH secret
+  retro-quarantines the affected ref(s); a fingerprint override lifts the block.
+  A reconciler keeps on-disk `hideRefs` matching the DB (event-driven + a periodic
+  safety sweep). No operator CLI/web yet — administration is the stage-6 web API.
+
+### Known limitation (Strategy A)
+
+A **ref-level** quarantine is enforced by hiding the ref, which is *silent* to the
+git client: a full clone just omits it; `git clone -b <hidden>` gets git's own
+"not found". Surfacing *why* a ref is hidden needs either the sideband
+success-message (Strategy B) or the web/triage UI — both deferred. A **repo-wide**
+quarantine does carry its reason in-band (the `ERR` message). See spec §3.3.
 
 ## Build & run
 
@@ -63,8 +79,11 @@ go test -short ./...     # skip the network (real GitHub) integration test
 ```
 
 - **Unit:** `internal/git` (path resolve; single-flight/cache/retry/cancel via an
-  injected clone fn), `internal/core` (Admit / read-only refusal),
-  `internal/httpsrv` (routing, block/error mapping) — with fakes.
+  injected clone fn; pkt-line + hideRefs against a real bare repo), `internal/core`
+  (Admit / gate / fail-open-once enqueue), `internal/verdict` (blocking-set +
+  recompute), `internal/scan` (gitleaks JSON parse + worker pipeline, via an
+  injected runner — the binary is not required), `internal/mirror` (reconcile +
+  sweep), `internal/httpsrv` (routing, block/error mapping) — with fakes.
 - **Integration (`internal/e2e`):** wires the real git/core/httpsrv stack behind
   an `httptest` server and drives actual `git clone` — over a local `file://`
   upstream (deterministic) and, unless `-short`, a real GitHub clone.
@@ -75,11 +94,15 @@ go test -short ./...     # skip the network (real GitHub) integration test
 ## Layout
 
 ```
-cmd/tulli         main; wiring
-internal/git      path resolve, lazy mirror (single-flight), http-backend handoff
-internal/core     the hallway: Gatekeeper (Admit/FinishAudit) + seams (Mirror/Store)
+cmd/tulli         main; wiring (server + scan worker + reconciler)
+internal/git      path resolve, lazy mirror (single-flight), http-backend handoff,
+                  ERR pkt-line + hideRefs + ref-containment (attribution)
+internal/core     the hallway: Gatekeeper (Admit/FinishAudit) + seams
+internal/verdict  blocking-set rule + recompute (findings + overrides → verdict)
+internal/scan     Scanner seam + gitleaks adapter + async fail-open-once worker
+internal/mirror   reconciler: DB verdicts → on-disk hideRefs (event + sweep)
 internal/httpsrv  HTTP door onto the hallway
-internal/store    core.Store backends: Mem (test fake) + pg/ (Postgres, sqlc)
+internal/store    backends: Mem (test fake) + pg/ (Postgres, sqlc)
 migrations/       embedded goose schema (spec §9)
 spike/stage0      throwaway proof of the CGI handoff (reference)
 ```

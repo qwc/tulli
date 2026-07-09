@@ -50,6 +50,8 @@ type Finding struct {
 	Fingerprint *string
 	Description *string
 	Raw         []byte
+	RepoID      *int64
+	Ref         *string
 }
 
 type Notification struct {

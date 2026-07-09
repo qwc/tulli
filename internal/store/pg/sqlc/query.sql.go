@@ -10,6 +10,50 @@ import (
 	"net/netip"
 )
 
+const affectedRefs = `-- name: AffectedRefs :many
+SELECT DISTINCT ref FROM findings WHERE repo_id = $1 AND ref IS NOT NULL
+`
+
+func (q *Queries) AffectedRefs(ctx context.Context, repoID *int64) ([]*string, error) {
+	rows, err := q.db.Query(ctx, affectedRefs, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*string
+	for rows.Next() {
+		var ref *string
+		if err := rows.Scan(&ref); err != nil {
+			return nil, err
+		}
+		items = append(items, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const currentDecision = `-- name: CurrentDecision :one
+SELECT decision FROM verdicts
+WHERE repo_id = $1 AND ref IS NOT DISTINCT FROM $2
+ORDER BY decided_at DESC LIMIT 1
+`
+
+type CurrentDecisionParams struct {
+	RepoID int64
+	Ref    *string
+}
+
+// The latest decision for a (repo, ref); IS NOT DISTINCT FROM matches NULL=NULL
+// so a repo-wide ($2 = NULL) lookup finds the repo-wide row.
+func (q *Queries) CurrentDecision(ctx context.Context, arg CurrentDecisionParams) (string, error) {
+	row := q.db.QueryRow(ctx, currentDecision, arg.RepoID, arg.Ref)
+	var decision string
+	err := row.Scan(&decision)
+	return decision, err
+}
+
 const currentQuarantines = `-- name: CurrentQuarantines :many
 SELECT ref, reason FROM (
     SELECT DISTINCT ON (repo_id, ref) ref, decision, reason
@@ -50,6 +94,56 @@ func (q *Queries) CurrentQuarantines(ctx context.Context, repoID int64) ([]Curre
 	return items, nil
 }
 
+const findingsForRef = `-- name: FindingsForRef :many
+SELECT scanner, severity, rule_id, file_path, line_number, commit_sha, fingerprint, description
+FROM findings WHERE repo_id = $1 AND ref = $2
+`
+
+type FindingsForRefParams struct {
+	RepoID *int64
+	Ref    *string
+}
+
+type FindingsForRefRow struct {
+	Scanner     string
+	Severity    string
+	RuleID      *string
+	FilePath    *string
+	LineNumber  *int32
+	CommitSha   *string
+	Fingerprint *string
+	Description *string
+}
+
+func (q *Queries) FindingsForRef(ctx context.Context, arg FindingsForRefParams) ([]FindingsForRefRow, error) {
+	rows, err := q.db.Query(ctx, findingsForRef, arg.RepoID, arg.Ref)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []FindingsForRefRow
+	for rows.Next() {
+		var i FindingsForRefRow
+		if err := rows.Scan(
+			&i.Scanner,
+			&i.Severity,
+			&i.RuleID,
+			&i.FilePath,
+			&i.LineNumber,
+			&i.CommitSha,
+			&i.Fingerprint,
+			&i.Description,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertAccessEvent = `-- name: InsertAccessEvent :exec
 INSERT INTO access_events (repo_id, source_ip, http_status, bytes)
 VALUES ($1, $4::inet, $2, $3)
@@ -70,6 +164,174 @@ func (q *Queries) InsertAccessEvent(ctx context.Context, arg InsertAccessEventPa
 		arg.SourceIp,
 	)
 	return err
+}
+
+const insertFinding = `-- name: InsertFinding :exec
+INSERT INTO findings
+    (scan_id, repo_id, ref, scanner, severity, rule_id, file_path, line_number, commit_sha, fingerprint, description)
+VALUES ($1, $2, $3, $4, $5, $6, $7,
+        $8, $9, $10, $11)
+`
+
+type InsertFindingParams struct {
+	ScanID      int64
+	RepoID      *int64
+	Ref         *string
+	Scanner     string
+	Severity    string
+	RuleID      *string
+	FilePath    *string
+	LineNumber  *int32
+	CommitSha   *string
+	Fingerprint *string
+	Description *string
+}
+
+func (q *Queries) InsertFinding(ctx context.Context, arg InsertFindingParams) error {
+	_, err := q.db.Exec(ctx, insertFinding,
+		arg.ScanID,
+		arg.RepoID,
+		arg.Ref,
+		arg.Scanner,
+		arg.Severity,
+		arg.RuleID,
+		arg.FilePath,
+		arg.LineNumber,
+		arg.CommitSha,
+		arg.Fingerprint,
+		arg.Description,
+	)
+	return err
+}
+
+const insertOverride = `-- name: InsertOverride :exec
+INSERT INTO overrides (repo_id, ref, fingerprint, reason, actor)
+VALUES ($1, $5, $2, $3, $4)
+`
+
+type InsertOverrideParams struct {
+	RepoID      int64
+	Fingerprint string
+	Reason      string
+	Actor       string
+	Ref         *string
+}
+
+func (q *Queries) InsertOverride(ctx context.Context, arg InsertOverrideParams) error {
+	_, err := q.db.Exec(ctx, insertOverride,
+		arg.RepoID,
+		arg.Fingerprint,
+		arg.Reason,
+		arg.Actor,
+		arg.Ref,
+	)
+	return err
+}
+
+const insertScan = `-- name: InsertScan :one
+INSERT INTO scans (repo_id, scanner, scope_kind, scope_expr, status, finished_at)
+VALUES ($1, $2, $3, $4, 'COMPLETE', NOW())
+RETURNING id
+`
+
+type InsertScanParams struct {
+	RepoID    int64
+	Scanner   string
+	ScopeKind string
+	ScopeExpr *string
+}
+
+func (q *Queries) InsertScan(ctx context.Context, arg InsertScanParams) (int64, error) {
+	row := q.db.QueryRow(ctx, insertScan,
+		arg.RepoID,
+		arg.Scanner,
+		arg.ScopeKind,
+		arg.ScopeExpr,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const insertVerdict = `-- name: InsertVerdict :exec
+INSERT INTO verdicts (repo_id, ref, decision, reason)
+VALUES ($1, $3, $2, $4)
+`
+
+type InsertVerdictParams struct {
+	RepoID   int64
+	Decision string
+	Ref      *string
+	Reason   *string
+}
+
+func (q *Queries) InsertVerdict(ctx context.Context, arg InsertVerdictParams) error {
+	_, err := q.db.Exec(ctx, insertVerdict,
+		arg.RepoID,
+		arg.Decision,
+		arg.Ref,
+		arg.Reason,
+	)
+	return err
+}
+
+const listRepos = `-- name: ListRepos :many
+SELECT id, mirror_path FROM repos
+`
+
+type ListReposRow struct {
+	ID         int64
+	MirrorPath string
+}
+
+func (q *Queries) ListRepos(ctx context.Context) ([]ListReposRow, error) {
+	rows, err := q.db.Query(ctx, listRepos)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListReposRow
+	for rows.Next() {
+		var i ListReposRow
+		if err := rows.Scan(&i.ID, &i.MirrorPath); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const overriddenFingerprints = `-- name: OverriddenFingerprints :many
+SELECT fingerprint FROM overrides WHERE repo_id = $1 AND (ref IS NULL OR ref = $2)
+`
+
+type OverriddenFingerprintsParams struct {
+	RepoID int64
+	Ref    *string
+}
+
+// Overrides apply repo-wide (ref IS NULL) or to a specific ref (spec §6.7 scope).
+func (q *Queries) OverriddenFingerprints(ctx context.Context, arg OverriddenFingerprintsParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, overriddenFingerprints, arg.RepoID, arg.Ref)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var fingerprint string
+		if err := rows.Scan(&fingerprint); err != nil {
+			return nil, err
+		}
+		items = append(items, fingerprint)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertRepo = `-- name: UpsertRepo :one

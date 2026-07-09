@@ -9,6 +9,7 @@ import (
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 
 	"codeberg.org/qwc/tulli/internal/core"
+	"codeberg.org/qwc/tulli/internal/verdict"
 )
 
 // startPG boots a real embedded Postgres for integration testing. Skipped in
@@ -134,5 +135,69 @@ func TestPG_ResolveVerdict(t *testing.T) {
 	}
 	if !v.RepoBlocked || v.Reason != "toxic repo" {
 		t.Fatalf("verdict = %+v, want RepoBlocked with reason 'toxic repo'", v)
+	}
+}
+
+// Exercise the stage-4 scan/recompute path against real Postgres: migration
+// 00002, the nullable-column pointer wrappers, and the override→CLEAN recompute.
+func TestPG_ScanFindingsAndRecompute(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	id, err := s.UpsertRepo(ctx, "https://github.com/o/scan", "/m/scan.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repos, err := s.ListRepos(ctx); err != nil || len(repos) == 0 {
+		t.Fatalf("ListRepos = %v, %v", repos, err)
+	}
+
+	scanID, err := s.InsertScan(ctx, id, "gitleaks", "RANGE", "--all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fnd := verdict.Finding{
+		Scanner: "gitleaks", Severity: verdict.SeverityHigh, RuleID: "aws",
+		FilePath: "cfg.yml", Line: 3, Commit: "c0ffee", Fingerprint: "fp1", Description: "AWS key",
+	}
+	if err := s.InsertFinding(ctx, scanID, id, "refs/heads/evil", fnd); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read-back round-trips the nullable columns.
+	got, err := s.FindingsForRef(ctx, id, "refs/heads/evil")
+	if err != nil || len(got) != 1 || got[0].Fingerprint != "fp1" || got[0].Line != 3 || got[0].Commit != "c0ffee" {
+		t.Fatalf("FindingsForRef = %+v, %v", got, err)
+	}
+	if refs, err := s.AffectedRefs(ctx, id); err != nil || len(refs) != 1 || refs[0] != "refs/heads/evil" {
+		t.Fatalf("AffectedRefs = %v, %v", refs, err)
+	}
+
+	// Recompute → QUARANTINED, and it shows up as a hidden ref.
+	if err := verdict.RecomputeRepo(ctx, s, id); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.CurrentDecision(ctx, id, "refs/heads/evil"); err != nil || d != verdict.DecisionQuarantined {
+		t.Fatalf("decision = %q, %v, want QUARANTINED", d, err)
+	}
+	v, _ := s.ResolveVerdict(ctx, id)
+	if len(v.HiddenRefs) != 1 || v.HiddenRefs[0] != "refs/heads/evil" {
+		t.Fatalf("hidden refs = %v, want evil", v.HiddenRefs)
+	}
+
+	// Override the fingerprint → recompute → CLEAN (spec §12 step 4).
+	if err := s.InsertOverride(ctx, id, "refs/heads/evil", "fp1", "false positive", "itsec"); err != nil {
+		t.Fatal(err)
+	}
+	if err := verdict.RecomputeRepo(ctx, s, id); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.CurrentDecision(ctx, id, "refs/heads/evil"); err != nil || d != verdict.DecisionClean {
+		t.Fatalf("after override decision = %q, %v, want CLEAN", d, err)
 	}
 }

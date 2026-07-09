@@ -2,8 +2,10 @@
 // IMPLEMENTATION.md). A single read-only binary that lazily mirrors a public
 // upstream on first fetch, gates it against the verdict store (repo-wide block
 // via ERR pkt-line, ref-level via uploadpack.hideRefs — spec §6), serves it via
-// git-http-backend, and records the fetch. Scanning that writes the verdicts,
-// plus identity, land in later stages behind the same seams.
+// git-http-backend, scans it asynchronously (gitleaks, fail-open-once, spec §7),
+// and reconciles the on-disk quarantine to the DB. Identity, Trivy/CVE, and the
+// web/triage UI (the operator-facing writer) land in later stages behind the
+// same seams.
 package main
 
 import (
@@ -13,13 +15,25 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
+	"codeberg.org/qwc/tulli/internal/mirror"
+	"codeberg.org/qwc/tulli/internal/scan"
 	"codeberg.org/qwc/tulli/internal/store"
 	"codeberg.org/qwc/tulli/internal/store/pg"
 )
+
+// backend is the full persistence surface tulli needs: the audit hallway
+// (core.Store), the scan writer (scan.Store), and the reconcile reader
+// (mirror.Store). Both internal/store.Mem and internal/store/pg satisfy it.
+type backend interface {
+	core.Store
+	scan.Store
+	mirror.Store
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -37,7 +51,7 @@ func main() {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	backend, err := git.NewBackend()
+	httpBackend, err := git.NewBackend()
 	if err != nil {
 		log.Error("git http-backend unavailable", "err", err)
 		os.Exit(1)
@@ -49,11 +63,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	mirror := git.NewMirror(mirrorRoot, *upstreamBase, log)
+	m := git.NewMirror(mirrorRoot, *upstreamBase, log)
 
-	// Audit store: Postgres when TULLI_DATABASE_URL is set, else in-memory
-	// (non-persistent). Both satisfy the core.Store seam.
-	var st core.Store
+	// Store: Postgres when TULLI_DATABASE_URL is set, else in-memory
+	// (non-persistent). Both satisfy the full backend surface.
+	var st backend
 	storeKind := "mem (non-persistent)"
 	if dsn := envOr("TULLI_DATABASE_URL", ""); dsn != "" {
 		pgs, err := pg.Open(context.Background(), dsn)
@@ -68,8 +82,18 @@ func main() {
 		st = store.NewMem()
 	}
 
-	gate := core.New(mirror, st, log)
-	srv := httpsrv.New(gate, backend, log)
+	ctx := context.Background()
+
+	// Reconciler (mirror-owning process): applies DB verdicts to on-disk hideRefs;
+	// its periodic sweep also recomputes verdicts written out of process (the
+	// future web API). Scan worker: fail-open-once gitleaks off the request path.
+	reconciler := mirror.NewReconciler(st, log)
+	worker := scan.NewWorker(scan.NewGitleaks(), st, git.RefsContaining, reconciler, log)
+	go worker.Run(ctx)
+	go reconciler.Run(ctx, 30*time.Second)
+
+	gate := core.New(m, st, worker, log)
+	srv := httpsrv.New(gate, httpBackend, log)
 
 	log.Info("tulli listening", "addr", *addr, "mirrors", mirrorRoot, "upstreamBase", *upstreamBase, "store", storeKind)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
