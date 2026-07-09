@@ -1,0 +1,33 @@
+# tulli demo stack: Postgres + the proxy. `docker compose up` brings both up;
+# ./demo.sh drives the §12 acceptance against it. The proxy mirrors from local
+# file:// fixtures (mounted read-only) so the demo needs no upstream network.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tulli
+      POSTGRES_PASSWORD: tulli
+      POSTGRES_DB: tulli
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tulli -d tulli"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tulli:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TULLI_ADDR: ":8080"
+      TULLI_DATA: /data
+      # Mirror from the mounted fixtures instead of the public internet.
+      TULLI_UPSTREAM_BASE: "file:///fixtures"
+      TULLI_DATABASE_URL: "postgres://tulli:tulli@postgres:5432/tulli?sslmode=disable"
+      # Short so the demo's override lift lands quickly (default 30s).
+      TULLI_RECONCILE_INTERVAL: "3s"
+    volumes:
+      - ./demo/fixtures:/fixtures:ro
+    ports:
+      - "8080:8080"

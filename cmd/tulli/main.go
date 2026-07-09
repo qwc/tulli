@@ -42,11 +42,23 @@ func envOr(key, def string) string {
 	return def
 }
 
+// envDuration reads a Go duration (e.g. "3s", "30s") from key, falling back to def.
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
 func main() {
 	addr := flag.String("addr", envOr("TULLI_ADDR", ":8080"), "listen address")
 	data := flag.String("data", envOr("TULLI_DATA", "./data"), "data dir (mirrors live in <data>/mirrors)")
 	upstreamBase := flag.String("upstream-base", envOr("TULLI_UPSTREAM_BASE", "https://"),
 		"upstream base: a bare scheme like https:// (default) or a URL prefix for file:// fixtures")
+	reconcile := flag.Duration("reconcile-interval", envDuration("TULLI_RECONCILE_INTERVAL", 30*time.Second),
+		"how often the reconcile safety sweep runs (catches out-of-process verdict/override writes)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -90,7 +102,7 @@ func main() {
 	reconciler := mirror.NewReconciler(st, log)
 	worker := scan.NewWorker(scan.NewGitleaks(), st, git.RefsContaining, reconciler, log)
 	go worker.Run(ctx)
-	go reconciler.Run(ctx, 30*time.Second)
+	go reconciler.Run(ctx, *reconcile)
 
 	gate := core.New(m, st, worker, log)
 	srv := httpsrv.New(gate, httpBackend, log)

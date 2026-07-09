@@ -264,7 +264,17 @@ upstream auth at fetch time, and **concurrent first-fetch single-flight** (§8).
 
 - Config surface: exact env vars (DATA dir, DB DSN, listen addrs, sweep/age-out
   knobs from spec §8.3/§8.8).
-- Reconciler cadence: event-driven (on verdict write) + periodic safety sweep?
+- Reconciler cadence: **RESOLVED (stage 4)** — event-driven on in-process verdict
+  writes + periodic safety sweep (default 30s, `TULLI_RECONCILE_INTERVAL`).
+- **Verdict provenance — needed before stage 6.** `verdict.RecomputeRepo` derives
+  verdicts purely from `findings` + `overrides`, so the sweep would **clobber a
+  human/manual verdict** (a repo-wide "toxic" QUARANTINED per §6.6 has no backing
+  finding → recompute writes CLEAN over it). Harmless today (nothing writes human
+  verdicts yet — all are scan-derived), but before the web API lets a person write
+  a decision, add a `provenance` (auto | human) to `verdicts`: recompute manages
+  only `auto` rows; the resolver honours both; a human row wins per §6.7's
+  toxic-quarantine guardrail. (Found while writing `demo.sh` — it is why the demo
+  shows only ref-level secret quarantine, not a repo-wide manual block.)
 - **Concurrent first-fetch (single-flight).** Spec §11.2 resolved "first fetch
   blocks," but two clients requesting the *same* un-mirrored repo simultaneously
   must not both run `git clone --mirror`. Collapse to one in-flight clone;

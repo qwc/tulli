@@ -68,7 +68,27 @@ git clone http://localhost:8080/repos/github.com/octocat/Hello-World
 | `-addr` | `TULLI_ADDR` | `:8080` | listen address |
 | `-data` | `TULLI_DATA` | `./data` | mirrors live in `<data>/mirrors` |
 | `-upstream-base` | `TULLI_UPSTREAM_BASE` | `https://` | upstream base; a bare scheme, or a URL prefix for `file://` test fixtures |
-| — | `TULLI_DATABASE_URL` | (unset) | Postgres DSN for the audit store; unset ⇒ in-memory (non-persistent). Migrations run automatically on start. |
+| `-reconcile-interval` | `TULLI_RECONCILE_INTERVAL` | `30s` | how often the reconcile safety sweep runs (catches out-of-process verdict/override writes) |
+| — | `TULLI_DATABASE_URL` | (unset) | Postgres DSN for the store; unset ⇒ in-memory (non-persistent). Migrations run automatically on start. |
+
+## Docker & the demo
+
+`docker compose up` brings up Postgres + the proxy (the image bundles `git` and
+`gitleaks`). `./demo.sh` then runs the spec §12 acceptance end to end — it needs
+only `git` and `docker` on the host (gitleaks, `psql`, and Postgres all run in
+containers):
+
+```sh
+./demo.sh                 # builds fixtures, brings up the stack, walks steps 1–4
+docker compose down -v    # tear down
+```
+
+The demo: clones a clean repo (→ CLEAN); points a leaky tag at another repo and
+watches gitleaks retro-quarantine it (fail-open-once); shows the tag withheld
+while `main` still clones; then overrides the finding by fingerprint (a direct
+SQL `INSERT`, standing in for the stage-6 web API) and watches the reconcile
+sweep lift the block. `TULLI_RECONCILE_INTERVAL` is set to `3s` in compose so the
+lift is quick.
 
 ## Test
 
