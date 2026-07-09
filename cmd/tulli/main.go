@@ -26,6 +26,7 @@ import (
 	"codeberg.org/qwc/tulli/internal/sshsrv"
 	"codeberg.org/qwc/tulli/internal/store"
 	"codeberg.org/qwc/tulli/internal/store/pg"
+	"codeberg.org/qwc/tulli/internal/web"
 )
 
 // backend is the full persistence surface tulli needs: the audit hallway
@@ -36,6 +37,7 @@ type backend interface {
 	scan.Store
 	mirror.Store
 	auth.Store
+	web.Store
 }
 
 func envOr(key, def string) string {
@@ -58,6 +60,7 @@ func envDuration(key string, def time.Duration) time.Duration {
 func main() {
 	addr := flag.String("addr", envOr("TULLI_ADDR", ":8080"), "HTTP listen address")
 	sshAddr := flag.String("ssh-addr", envOr("TULLI_SSH_ADDR", ""), "SSH listen address (e.g. :2222); empty disables the SSH door")
+	webAddr := flag.String("web-addr", envOr("TULLI_WEB_ADDR", ""), "web/API listen address (e.g. :8081); empty disables the web surface")
 	data := flag.String("data", envOr("TULLI_DATA", "./data"), "data dir (mirrors live in <data>/mirrors)")
 	upstreamBase := flag.String("upstream-base", envOr("TULLI_UPSTREAM_BASE", "https://"),
 		"upstream base: a bare scheme like https:// (default) or a URL prefix for file:// fixtures")
@@ -113,6 +116,21 @@ func main() {
 	// Identity provider (stage 6a): the local database is the first provider;
 	// LDAP/OIDC slot in behind auth.Authenticator later.
 	authr := auth.NewDBProvider(st)
+
+	// Web/API surface (stage 6b): the single writer of human intents, on its own
+	// port off the git surface. It writes desired state to the DB; the reconciler
+	// applies it. The bootstrap admin token (from env, never a flag) mints the
+	// first real users; empty means only DB-token users can authenticate.
+	if *webAddr != "" {
+		websrv := web.New(st, authr, os.Getenv("TULLI_BOOTSTRAP_ADMIN_TOKEN"), log)
+		go func() {
+			log.Info("tulli web listening", "addr", *webAddr)
+			if err := http.ListenAndServe(*webAddr, websrv.Handler()); err != nil {
+				log.Error("web server exited", "err", err)
+				os.Exit(1)
+			}
+		}()
+	}
 
 	// SSH door (second transport onto the same hallway). Optional: only when an
 	// address is configured. SSH is authenticated — unknown keys are rejected.

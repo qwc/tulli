@@ -41,6 +41,12 @@ Early prototype, built in stages (see `IMPLEMENTATION.md` §5).
   to the resolved user in the audit trail. Verdicts also carry provenance — human
   quarantines live in a `manual_blocks` input table so the recompute sweep can't
   clobber them.
+- **Stage 6b-core ✅** — the human-facing surface: a JSON API (`internal/web`, own
+  port, off the git surface) is the single writer of human intents — block/unblock
+  a ref or repo, override a finding, manage users/tokens/keys — with bearer-token
+  auth and role-based access (viewer/reviewer/admin). `cmd/tullictl` is the CLI
+  client. A block written through the API becomes a git-side quarantine on the next
+  reconcile sweep. A browser UI (token→session login) is the next slice.
 
 ### Known limitation (Strategy A)
 
@@ -134,6 +140,7 @@ internal/mirror   reconciler: DB verdicts → on-disk hideRefs (event + sweep)
 internal/httpsrv  HTTP door onto the hallway
 internal/sshsrv   SSH door onto the hallway (x/crypto/ssh)
 internal/auth     identity & access: credential → user, pluggable provider seam
+internal/web      JSON API + RBAC — the human-intent writer (cmd/tullictl client)
 internal/store    backends: Mem (test fake) + pg/ (Postgres, sqlc)
 migrations/       embedded goose schema (spec §9)
 spike/stage0      throwaway proof of the CGI handoff (reference)
