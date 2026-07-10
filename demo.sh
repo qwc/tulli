@@ -22,6 +22,11 @@ set -euo pipefail
 PROXY="${PROXY:-http://localhost:8080}"
 COMPOSE=(docker compose)
 FIXTURES="demo/fixtures"
+
+# The compose stack defaults to real https upstreams; the demo runs fully
+# offline against the local file:// fixtures and wants a snappy override lift.
+export TULLI_UPSTREAM_BASE="file:///fixtures"
+export TULLI_RECONCILE_INTERVAL="3s"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -95,6 +100,10 @@ bare_tainted "$FIXTURES/example.com/acme/widget" "$KEY"
 ok "clean repo + tainted repo (leaky tag v1-leak) built"
 
 step "Bringing up the stack (postgres + tulli)"
+# Start from a clean slate: the stack persists mirrors + DB in named volumes,
+# and a prior run's already-quarantined widget mirror would break step 2's
+# fail-open-once first fetch.
+"${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 "${COMPOSE[@]}" up -d --build
 poll 90 advertises "example.com/acme/clean" "" || die "tulli did not come up"
 ok "proxy is serving on $PROXY"

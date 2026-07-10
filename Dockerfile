@@ -41,5 +41,6 @@ COPY --from=build /out/tulli /usr/local/bin/tulli
 
 USER tulli
 ENV TULLI_ADDR=:8080 TULLI_DATA=/data
-EXPOSE 8080
+# 8080 git http-backend, 8081 web/API+UI, 2222 ssh (all opt-in via env/compose).
+EXPOSE 8080 8081 2222
 ENTRYPOINT ["tulli"]

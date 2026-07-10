@@ -1,6 +1,18 @@
-# tulli demo stack: Postgres + the proxy. `docker compose up` brings both up;
-# ./demo.sh drives the §12 acceptance against it. The proxy mirrors from local
-# file:// fixtures (mounted read-only) so the demo needs no upstream network.
+# tulli — local testing stack: Postgres + the proxy, with ALL surfaces wired.
+#
+#   git http : http://localhost:8080   clone/fetch through the proxy
+#   web UI   : http://localhost:8081   sign in with the bootstrap admin token
+#   ssh      : ssh://git@localhost:2222 (register a key in the UI first)
+#
+# Quick start:
+#   docker compose up -d --build
+#   # browse http://localhost:8081 and sign in with TULLI_BOOTSTRAP_ADMIN_TOKEN
+#   git clone http://localhost:8080/repos/github.com/octocat/Hello-World
+#   docker compose down          # keep mirrors/db     (down -v wipes them)
+#
+# Every value below is overridable from the shell / a .env file. ./demo.sh sets
+# TULLI_UPSTREAM_BASE=file:///fixtures + a short reconcile to run the §12
+# secret-quarantine acceptance against this same stack.
 services:
   postgres:
     image: postgres:16-alpine
@@ -13,6 +25,11 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+    volumes:
+      - tulli-db:/var/lib/postgresql/data
+    # Uncomment to poke the DB from the host with a local psql:
+    # ports:
+    #   - "5433:5432"
 
   tulli:
     build: .
@@ -21,13 +38,34 @@ services:
         condition: service_healthy
     environment:
       TULLI_ADDR: ":8080"
+      # Web/API + browser UI on its own port (single writer of human intents).
+      TULLI_WEB_ADDR: ":8081"
+      # Second transport onto the same hallway; SSH rejects unknown keys.
+      TULLI_SSH_ADDR: ":2222"
       TULLI_DATA: /data
-      # Mirror from the mounted fixtures instead of the public internet.
-      TULLI_UPSTREAM_BASE: "file:///fixtures"
+      # Real upstreams by default (…/repos/github.com/owner/repo). ./demo.sh
+      # overrides this with file:///fixtures for the offline acceptance run.
+      TULLI_UPSTREAM_BASE: "${TULLI_UPSTREAM_BASE:-https://}"
       TULLI_DATABASE_URL: "postgres://tulli:tulli@postgres:5432/tulli?sslmode=disable"
-      # Short so the demo's override lift lands quickly (default 30s).
-      TULLI_RECONCILE_INTERVAL: "3s"
+      # Snappy so manual/triage/override actions land quickly (default 30s).
+      TULLI_RECONCILE_INTERVAL: "${TULLI_RECONCILE_INTERVAL:-10s}"
+      # First-admin login token — sign in with this at the web UI, then mint
+      # real users. Change it for anything but local testing.
+      TULLI_BOOTSTRAP_ADMIN_TOKEN: "${TULLI_BOOTSTRAP_ADMIN_TOKEN:-demo-admin}"
+      # Fixed dev secret so sessions survive restarts. DEV ONLY — set a real
+      # random value (and TULLI_WEB_SECURE_COOKIES=true behind TLS) in prod.
+      TULLI_SESSION_SECRET: "${TULLI_SESSION_SECRET:-dev-insecure-session-secret-change-me}"
+      TULLI_WEB_SECURE_COOKIES: "${TULLI_WEB_SECURE_COOKIES:-false}"
     volumes:
+      # Local fixtures for the file:// demo (unused when upstream is https://).
       - ./demo/fixtures:/fixtures:ro
+      # Persist mirrors + the generated SSH host key across restarts.
+      - tulli-data:/data
     ports:
       - "8080:8080"
+      - "8081:8081"
+      - "2222:2222"
+
+volumes:
+  tulli-data:
+  tulli-db:
