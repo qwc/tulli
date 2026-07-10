@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -55,6 +56,23 @@ func envDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// webSessionSecret returns the HMAC secret for browser session cookies. In prod
+// set TULLI_SESSION_SECRET so sessions survive restarts and are shared across
+// replicas; otherwise a random per-process secret is generated (sessions then
+// end on restart), and we warn.
+func webSessionSecret(log *slog.Logger) []byte {
+	if v := os.Getenv("TULLI_SESSION_SECRET"); v != "" {
+		return []byte(v)
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Error("cannot generate a session secret", "err", err)
+		os.Exit(1)
+	}
+	log.Warn("TULLI_SESSION_SECRET unset — using a random per-process secret; web sessions will not survive restart")
+	return b
 }
 
 func main() {
@@ -122,7 +140,9 @@ func main() {
 	// applies it. The bootstrap admin token (from env, never a flag) mints the
 	// first real users; empty means only DB-token users can authenticate.
 	if *webAddr != "" {
-		websrv := web.New(st, authr, os.Getenv("TULLI_BOOTSTRAP_ADMIN_TOKEN"), log)
+		secret := webSessionSecret(log)
+		secureCookies := envOr("TULLI_WEB_SECURE_COOKIES", "") == "true"
+		websrv := web.New(st, authr, os.Getenv("TULLI_BOOTSTRAP_ADMIN_TOKEN"), secret, secureCookies, log)
 		go func() {
 			log.Info("tulli web listening", "addr", *webAddr)
 			if err := http.ListenAndServe(*webAddr, websrv.Handler()); err != nil {

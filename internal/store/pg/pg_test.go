@@ -239,6 +239,21 @@ func TestPG_AuthLookups(t *testing.T) {
 		t.Fatalf("UserByTokenHash = %+v ok=%v err=%v", id2, ok, err)
 	}
 
+	// UserByID re-resolves the session principal (revocation path).
+	id3, ok, err := s.UserByID(ctx, uid)
+	if err != nil || !ok || id3.UserID != uid || id3.Role != auth.RoleReviewer {
+		t.Fatalf("UserByID = %+v ok=%v err=%v", id3, ok, err)
+	}
+	if _, ok, _ := s.UserByID(ctx, 999999); ok {
+		t.Error("unknown user id must not resolve")
+	}
+
+	// ListUsers backs the admin view.
+	users, err := s.ListUsers(ctx)
+	if err != nil || len(users) != 1 || users[0].UserID != uid {
+		t.Fatalf("ListUsers = %+v err=%v, want the single seeded user", users, err)
+	}
+
 	if _, ok, _ := s.UserByFingerprint(ctx, "SHA256:missing"); ok {
 		t.Error("unknown fingerprint must not resolve")
 	}

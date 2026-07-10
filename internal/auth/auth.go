@@ -62,6 +62,11 @@ type Store interface {
 	// UserByTokenHash resolves a hashed HTTP token to an identity; ok is false
 	// when the token is unknown.
 	UserByTokenHash(ctx context.Context, tokenHash string) (id Identity, ok bool, err error)
+	// UserByID resolves a user id to a current identity; ok is false when the
+	// user is gone. The web re-resolves the session principal through this on
+	// every request, so a demoted or deleted user loses access immediately
+	// (revocation) rather than at cookie expiry.
+	UserByID(ctx context.Context, userID int64) (id Identity, ok bool, err error)
 }
 
 // Authenticator resolves transport credentials to an Identity. Adapters depend on

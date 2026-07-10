@@ -1,0 +1,19 @@
+{{define "content"}}
+<h1>Account</h1>
+<p>Signed in as <strong>{{.Me.Login}}</strong>
+   <span class="badge role">{{.Me.Role}}</span>
+   <span class="muted">({{.Me.Kind}})</span></p>
+
+{{if .Data.Error}}<div class="banner err">{{.Data.Error}}</div>{{end}}
+{{if .Data.Message}}<div class="banner ok">{{.Data.Message}}</div>{{end}}
+
+<fieldset>
+  <legend>Add an SSH public key</legend>
+  <form method="post" action="/account/keys">
+    <label>authorized_keys line</label>
+    <textarea name="public_key" placeholder="ssh-ed25519 AAAA... you@host" required></textarea>
+    <p class="muted">We store the fingerprint so pulls over SSH are attributed to you.</p>
+    <button class="primary" type="submit">Add key</button>
+  </form>
+</fieldset>
+{{end}}

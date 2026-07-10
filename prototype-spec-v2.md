@@ -244,8 +244,21 @@ It is unrelated to upstream: upstreams are public FOSS fetched anonymously
   notification *precise* ("you pulled `evil@abc123`, now quarantined") instead
   of "someone from this IP touched this repo."
 
-Login mechanism for the prototype can be minimal (local accounts / a shared
-dev login). OIDC/SSO is deferred.
+**Login mechanism (RESOLVED, stage 6b-ui).** Sessions are the permanent
+abstraction; *credentials* (a token now; LDAP/OIDC later; passwords maybe never)
+only **establish** a session. So the browser login page takes a **token** — the
+same per-user token that authenticates the API and tullictl — and mints a
+session cookie; no passwords are built (LDAP/OIDC in 6e cover humans). The login
+form's token field later grows "Sign in with LDAP/OIDC" buttons beside it, and
+nothing built now is discarded.
+
+The session cookie is a stateless HMAC-signed `{uid, exp}` (secret from
+`TULLI_SESSION_SECRET` so a carved-out web replica validates it too — §4); the
+**role/kind are re-resolved from the DB per request**, so demoting or disabling a
+user takes effect immediately (revocation, not stale-until-expiry). The bootstrap
+admin token logs in the same way (synthetic admin session) so the first admin can
+sign in before any user row exists. OIDC/SSO remains deferred to 6e behind the
+`auth.Authenticator` seam.
 
 ---
 

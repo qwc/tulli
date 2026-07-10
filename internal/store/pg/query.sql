@@ -32,6 +32,12 @@ SELECT u.id, u.name, u.role, u.kind
 FROM tokens t JOIN users u ON u.id = t.user_id
 WHERE t.token_hash = $1;
 
+-- name: UserByID :one
+SELECT id, name, role, kind FROM users WHERE id = $1;
+
+-- name: ListUsers :many
+SELECT id, name, role, kind FROM users ORDER BY id;
+
 -- name: InsertScan :one
 INSERT INTO scans (repo_id, scanner, scope_kind, scope_expr, status, finished_at)
 VALUES ($1, $2, $3, sqlc.narg('scope_expr'), 'COMPLETE', NOW())

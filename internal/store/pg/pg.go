@@ -268,6 +268,31 @@ func (s *Store) UserByTokenHash(ctx context.Context, tokenHash string) (auth.Ide
 	return auth.Identity{UserID: r.ID, Login: r.Name, Role: auth.Role(r.Role), Kind: auth.Kind(r.Kind)}, true, nil
 }
 
+// UserByID resolves a user id to its current identity (session re-resolve).
+func (s *Store) UserByID(ctx context.Context, userID int64) (auth.Identity, bool, error) {
+	r, err := s.q.UserByID(ctx, userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return auth.Identity{}, false, nil
+	}
+	if err != nil {
+		return auth.Identity{}, false, err
+	}
+	return auth.Identity{UserID: r.ID, Login: r.Name, Role: auth.Role(r.Role), Kind: auth.Kind(r.Kind)}, true, nil
+}
+
+// ListUsers returns all users, id-ordered (admin views).
+func (s *Store) ListUsers(ctx context.Context) ([]auth.Identity, error) {
+	rows, err := s.q.ListUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]auth.Identity, len(rows))
+	for i, r := range rows {
+		out[i] = auth.Identity{UserID: r.ID, Login: r.Name, Role: auth.Role(r.Role), Kind: auth.Kind(r.Kind)}
+	}
+	return out, nil
+}
+
 func (s *Store) InsertAccessEvent(ctx context.Context, a core.Access) error {
 	p := sqlc.InsertAccessEventParams{}
 	if a.RepoID != 0 {

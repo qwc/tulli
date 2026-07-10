@@ -20,9 +20,11 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"html/template"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -30,6 +32,10 @@ import (
 	"codeberg.org/qwc/tulli/internal/core"
 	"codeberg.org/qwc/tulli/internal/verdict"
 )
+
+// sessionTTL is how long a browser session cookie stays valid. Role/kind are
+// re-resolved every request regardless, so this only bounds re-login frequency.
+const sessionTTL = 12 * time.Hour
 
 // Store is the persistence surface the web API needs: reads for the views and
 // intent/identity writes. Every method already exists on internal/store.Mem and
@@ -44,17 +50,36 @@ type Store interface {
 	InsertUser(ctx context.Context, name string, role auth.Role, kind auth.Kind) (int64, error)
 	InsertToken(ctx context.Context, userID int64, tokenHash string) error
 	InsertSSHKey(ctx context.Context, userID int64, fingerprint, pubkey string) error
+	// UserByID re-resolves the session principal each request (revocation).
+	UserByID(ctx context.Context, userID int64) (auth.Identity, bool, error)
+	// ListUsers backs the admin users view.
+	ListUsers(ctx context.Context) ([]auth.Identity, error)
 }
 
 type Server struct {
-	store      Store
-	authr      auth.Authenticator
-	adminToken string // bootstrap admin bearer token (empty = no bootstrap admin)
-	log        *slog.Logger
+	store         Store
+	authr         auth.Authenticator
+	adminToken    string // bootstrap admin bearer token (empty = no bootstrap admin)
+	sessions      *sessions
+	secureCookies bool
+	tmpl          map[string]*template.Template
+	log           *slog.Logger
 }
 
-func New(store Store, authr auth.Authenticator, adminToken string, log *slog.Logger) *Server {
-	return &Server{store: store, authr: authr, adminToken: adminToken, log: log}
+// New builds the web server. sessionSecret signs browser session cookies (a
+// random per-process secret means sessions do not survive restart / are not
+// shared across replicas — set it in prod). secureCookies marks the session
+// cookie Secure (set true behind TLS; false for the plain-HTTP prototype).
+func New(store Store, authr auth.Authenticator, adminToken string, sessionSecret []byte, secureCookies bool, log *slog.Logger) *Server {
+	return &Server{
+		store:         store,
+		authr:         authr,
+		adminToken:    adminToken,
+		sessions:      newSessions(sessionSecret, sessionTTL),
+		secureCookies: secureCookies,
+		tmpl:          parseTemplates(),
+		log:           log,
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -62,6 +87,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
+
+	// JSON API (tullictl + programmatic clients) — bearer-token auth.
 	mux.HandleFunc("GET /api/repos", s.guard(auth.RoleViewer, s.listRepos))
 	mux.HandleFunc("GET /api/repos/{id}", s.guard(auth.RoleViewer, s.getRepo))
 	mux.HandleFunc("POST /api/repos/{id}/block", s.guard(auth.RoleReviewer, s.blockRef))
@@ -70,6 +97,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/users", s.guard(auth.RoleAdmin, s.createUser))
 	mux.HandleFunc("POST /api/users/{id}/tokens", s.guard(auth.RoleAdmin, s.createToken))
 	mux.HandleFunc("POST /api/users/{id}/keys", s.guard(auth.RoleAdmin, s.addKey))
+
+	// Browser UI (6b-ui) — session-cookie auth, server-rendered html/template.
+	mux.HandleFunc("GET /login", s.getLogin)
+	mux.HandleFunc("POST /login", s.postLogin)
+	mux.HandleFunc("POST /logout", s.postLogout)
+	mux.HandleFunc("GET /{$}", s.guardHTML(auth.RoleViewer, s.reposPage))
+	mux.HandleFunc("GET /repos/{id}", s.guardHTML(auth.RoleViewer, s.repoPage))
+	mux.HandleFunc("POST /repos/{id}/block", s.guardHTML(auth.RoleReviewer, s.htmlBlock))
+	mux.HandleFunc("POST /repos/{id}/unblock", s.guardHTML(auth.RoleReviewer, s.htmlUnblock))
+	mux.HandleFunc("POST /repos/{id}/overrides", s.guardHTML(auth.RoleReviewer, s.htmlOverride))
+	mux.HandleFunc("GET /account", s.guardHTML(auth.RoleViewer, s.accountPage))
+	mux.HandleFunc("POST /account/keys", s.guardHTML(auth.RoleViewer, s.accountAddKey))
+	mux.HandleFunc("GET /users", s.guardHTML(auth.RoleAdmin, s.usersPage))
+	mux.HandleFunc("POST /users", s.guardHTML(auth.RoleAdmin, s.usersCreate))
+	mux.HandleFunc("POST /users/{id}/tokens", s.guardHTML(auth.RoleAdmin, s.usersMintToken))
+	mux.HandleFunc("POST /users/{id}/keys", s.guardHTML(auth.RoleAdmin, s.usersAddKey))
 	return mux
 }
 
@@ -94,23 +137,60 @@ func (s *Server) guard(min auth.Role, h handlerFunc) http.HandlerFunc {
 	}
 }
 
-// authenticate resolves the request's bearer token: the bootstrap admin token
-// (constant-time compared) yields a synthetic admin; otherwise the token is
-// looked up via the provider. A missing/unknown token is unauthenticated.
+// authenticate resolves a request to an identity from either credential source:
+// an Authorization: Bearer token (tullictl / API), or the browser session
+// cookie (UI). A missing/unknown credential is unauthenticated.
 func (s *Server) authenticate(r *http.Request) (auth.Identity, bool) {
-	tok, ok := bearer(r)
-	if !ok {
-		return auth.Anonymous, false
+	if tok, ok := bearer(r); ok {
+		return s.identityFromToken(r.Context(), tok)
 	}
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		return s.identityFromSession(r.Context(), c.Value)
+	}
+	return auth.Anonymous, false
+}
+
+// identityFromToken resolves a raw token: the bootstrap admin token
+// (constant-time compared) yields a synthetic admin; otherwise the provider.
+func (s *Server) identityFromToken(ctx context.Context, tok string) (auth.Identity, bool) {
 	if s.adminToken != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(s.adminToken)) == 1 {
-		return auth.Identity{Login: "bootstrap-admin", Role: auth.RoleAdmin, Kind: auth.KindHuman}, true
+		return bootstrapAdminIdentity(), true
 	}
-	id, ok, err := s.authr.ByToken(r.Context(), tok)
+	id, ok, err := s.authr.ByToken(ctx, tok)
 	if err != nil {
 		s.log.Error("web token lookup failed", "err", err)
 		return auth.Anonymous, false
 	}
 	return id, ok
+}
+
+// identityFromSession verifies a session cookie and re-resolves the principal.
+// The bootstrap-admin session (sentinel uid) is honoured only while the
+// bootstrap token is still configured; a real user's role/kind is re-read from
+// the store every request, so demotion/deletion revokes access immediately.
+func (s *Server) identityFromSession(ctx context.Context, value string) (auth.Identity, bool) {
+	uid, ok := s.sessions.verify(value)
+	if !ok {
+		return auth.Anonymous, false
+	}
+	if uid == bootstrapAdminUID {
+		if s.adminToken == "" {
+			return auth.Anonymous, false // bootstrap disabled → its sessions are void
+		}
+		return bootstrapAdminIdentity(), true
+	}
+	id, ok, err := s.store.UserByID(ctx, uid)
+	if err != nil {
+		s.log.Error("web session user lookup failed", "err", err)
+		return auth.Anonymous, false
+	}
+	return id, ok
+}
+
+// bootstrapAdminIdentity is the synthetic principal for the config bootstrap
+// token. It has no user row (UserID 0), so account routes reject it.
+func bootstrapAdminIdentity() auth.Identity {
+	return auth.Identity{Login: "bootstrap-admin", Role: auth.RoleAdmin, Kind: auth.KindHuman}
 }
 
 func roleRank(r auth.Role) int {
@@ -186,22 +266,30 @@ func (s *Server) getRepo(w http.ResponseWriter, r *http.Request, _ auth.Identity
 	if !ok {
 		return
 	}
-	v, err := s.store.ResolveVerdict(r.Context(), id)
+	detail, err := s.buildRepoDetail(r.Context(), id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "resolve verdict failed")
+		writeErr(w, http.StatusInternalServerError, "repo lookup failed")
 		return
 	}
-	refs, err := s.store.AffectedRefs(r.Context(), id)
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// buildRepoDetail assembles a repo's verdict + findings — shared by the JSON API
+// and the HTML detail page so both show the same data.
+func (s *Server) buildRepoDetail(ctx context.Context, id int64) (repoDetail, error) {
+	v, err := s.store.ResolveVerdict(ctx, id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "affected refs failed")
-		return
+		return repoDetail{}, err
+	}
+	refs, err := s.store.AffectedRefs(ctx, id)
+	if err != nil {
+		return repoDetail{}, err
 	}
 	var findings []findingView
 	for _, ref := range refs {
-		fs, err := s.store.FindingsForRef(r.Context(), id, ref)
+		fs, err := s.store.FindingsForRef(ctx, id, ref)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "findings lookup failed")
-			return
+			return repoDetail{}, err
 		}
 		for _, f := range fs {
 			findings = append(findings, findingView{
@@ -210,10 +298,10 @@ func (s *Server) getRepo(w http.ResponseWriter, r *http.Request, _ auth.Identity
 			})
 		}
 	}
-	writeJSON(w, http.StatusOK, repoDetail{
+	return repoDetail{
 		repoView: repoView{ID: id, Blocked: v.RepoBlocked, Reason: v.Reason, HiddenRefs: v.HiddenRefs},
 		Findings: findings,
-	})
+	}, nil
 }
 
 // --- intent write handlers ---
@@ -239,12 +327,8 @@ func (s *Server) setBlock(w http.ResponseWriter, r *http.Request, id auth.Identi
 	if !decode(w, r, &req) {
 		return
 	}
-	if active && req.Reason == "" {
-		writeErr(w, http.StatusBadRequest, "a block requires a reason")
-		return
-	}
-	if err := s.store.InsertManualBlock(r.Context(), repoID, req.Ref, active, req.Reason, id.Login); err != nil {
-		writeErr(w, http.StatusInternalServerError, "write manual block failed")
+	if ie := s.applyBlock(r.Context(), repoID, req.Ref, active, req.Reason, id.Login); ie != nil {
+		writeErr(w, ie.code, ie.msg)
 		return
 	}
 	// The write is desired state; the reconciler sweep applies it to disk (§4).
@@ -266,15 +350,41 @@ func (s *Server) addOverride(w http.ResponseWriter, r *http.Request, id auth.Ide
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.Fingerprint == "" || req.Reason == "" {
-		writeErr(w, http.StatusBadRequest, "an override requires a fingerprint and a reason")
-		return
-	}
-	if err := s.store.InsertOverride(r.Context(), repoID, req.Ref, req.Fingerprint, req.Reason, id.Login); err != nil {
-		writeErr(w, http.StatusInternalServerError, "write override failed")
+	if ie := s.applyOverride(r.Context(), repoID, req.Ref, req.Fingerprint, req.Reason, id.Login); ie != nil {
+		writeErr(w, ie.code, ie.msg)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"applied": "pending reconcile"})
+}
+
+// intentError carries an HTTP status + message so the shared intent-write
+// helpers can serve both the JSON API (writeErr) and the HTML forms (re-render).
+type intentError struct {
+	code int
+	msg  string
+}
+
+// applyBlock validates and records a manual block/lift. Single source of the
+// rule for both the JSON API and the HTML form so they cannot drift.
+func (s *Server) applyBlock(ctx context.Context, repoID int64, ref string, active bool, reason, actor string) *intentError {
+	if active && reason == "" {
+		return &intentError{http.StatusBadRequest, "a block requires a reason"}
+	}
+	if err := s.store.InsertManualBlock(ctx, repoID, ref, active, reason, actor); err != nil {
+		return &intentError{http.StatusInternalServerError, "write manual block failed"}
+	}
+	return nil
+}
+
+// applyOverride validates and records a finding override (VEX waiver).
+func (s *Server) applyOverride(ctx context.Context, repoID int64, ref, fingerprint, reason, actor string) *intentError {
+	if fingerprint == "" || reason == "" {
+		return &intentError{http.StatusBadRequest, "an override requires a fingerprint and a reason"}
+	}
+	if err := s.store.InsertOverride(ctx, repoID, ref, fingerprint, reason, actor); err != nil {
+		return &intentError{http.StatusInternalServerError, "write override failed"}
+	}
+	return nil
 }
 
 // --- identity handlers (admin) ---
@@ -358,13 +468,22 @@ func newToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+// pathIDVal parses the {id} path value without writing a response.
+func pathIDVal(r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
-		writeErr(w, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return id, true
+}
+
+// pathID is the JSON-API variant: it writes a 400 on a bad id.
+func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, ok := pathIDVal(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid id")
+	}
+	return id, ok
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {

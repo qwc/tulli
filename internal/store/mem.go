@@ -317,6 +317,26 @@ func (m *Mem) UserByTokenHash(_ context.Context, tokenHash string) (auth.Identit
 	return id, ok, nil
 }
 
+// UserByID resolves a user id to its current identity (session re-resolve).
+func (m *Mem) UserByID(_ context.Context, userID int64) (auth.Identity, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.users[userID]
+	return id, ok, nil
+}
+
+// ListUsers returns all users, id-ordered (admin views).
+func (m *Mem) ListUsers(_ context.Context) ([]auth.Identity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]auth.Identity, 0, len(m.users))
+	for _, id := range m.users {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
+	return out, nil
+}
+
 // Events returns a copy of the recorded access events (for tests/inspection).
 func (m *Mem) Events() []core.Access {
 	m.mu.Lock()

@@ -195,10 +195,60 @@ Each stage is a testable vertical slice.
    (Scanner seam + gitleaks adapter + in-memory Enqueuer + async worker),
    `internal/mirror` (reconciler: event + periodic sweep). §12 step-4 override is
    a documented `demo.sh` SQL scaffold. gitleaks-only; Trivy/SBOM/CVE → stage 6.
-5. **SSH transport** (second door, same hallway).
-6. **Identity/self-service, Trivy+SBOM, triage web UI** — order TBD.
+5. ✅ **DONE — SSH transport** (second door, same hallway).
+6. **Identity / web / scanners / triage**, decomposed (full §9 schema already
+   exists, so these are code/UI over existing tables):
+   - ✅ **6a identity & access core** — `internal/auth` provider seam
+     (`Authenticator`; LDAP/OIDC drop in later), role (viewer/reviewer/admin) +
+     kind (human/robot) model, identity threaded into `Admit` for audit.
+   - ✅ **6b-core web API + RBAC + tullictl** — `internal/web` JSON API on its own
+     port (`TULLI_WEB_ADDR`), single human-intent writer (§4), bearer-token auth +
+     bootstrap admin token; `cmd/tullictl` client.
+   - **6b-ui web UI** (design below) — server-rendered pages + token→session login.
+   - **6c Trivy/SBOM/CVE** (Deep lane; `vuln_matches`→triage; never auto-block).
+   - **6d triage + notify** (closes the founding motivation).
+   - **6e LDAP**, **6f robot users**, **6g full/per-repo RBAC** — behind 6a's seams.
 
 Demoable secret-quarantine flow by stage 4.
+
+### 6b-ui — web UI shape (RESOLVED, design-first)
+
+Additive to the existing `internal/web` `Server` on the same port — not a new
+binary. The mux grows HTML routes beside the `/api/*` JSON routes; `authenticate()`
+grows a cookie branch beside the Bearer branch; `guard()`/`roleRank` are untouched,
+so the stage-6a RBAC drives the UI unchanged. Still DB-only (§4), so the future
+carve-out into its own executable stays a `main()`+Dockerfile change.
+
+- **Sessions (revocable).** Stateless HMAC-signed cookie carrying only `{uid, exp}`
+  (secret from `TULLI_SESSION_SECRET`); role/kind **re-resolved per request** via a
+  new `auth.Store.UserByID` (mem + pg) so demote/disable is immediate. Wrapped
+  behind a small `session` seam (`Issue`/`Verify`) so a DB-backed revocable store
+  can replace it later. Cookie attrs: `HttpOnly`, `Path=/`, expiry, `SameSite=Lax`;
+  `Secure` gated behind `TULLI_WEB_SECURE_COOKIES` (off in prototype plain-HTTP,
+  **must be on in prod / behind TLS**).
+- **Login (no passwords).** `GET /login` = single token field (future LDAP/OIDC
+  buttons slot beside it); `POST /login` mirrors `authenticate()`'s two branches
+  (constant-time bootstrap-admin compare → synthetic admin session; else
+  `authr.ByToken`) → sets cookie, `303 /`. `POST /logout` clears it.
+- **Pages.** `GET /` repo list (verdict badges); `GET /repos/{id}` detail
+  (verdict + findings table + block state). Reviewer action **forms** post to new
+  HTML routes (`POST /repos/{id}/block|unblock|overrides`) that call the *same*
+  store methods as the JSON handlers (factor a shared intent-write helper so they
+  can't drift), then `303` back (Post/Redirect/Get). `GET /account` +
+  `POST /account/keys` = **self-service SSH key upload** for the logged-in user
+  (closes the 6b-core deferral). **Admin pages** (`GET /users` + create-user / mint-
+  token / add-key forms) are in scope for 6b-ui.
+- **Escaping (load-bearing).** `html/template` (auto-escaping) only — findings
+  carry untrusted upstream data (paths, rule text, commit messages). Never
+  `text/template`; no `template.HTML` on those fields. Templates embedded via
+  `//go:embed`, parsed once in `New()`.
+- **CSRF — simple now, harden before leaving prototype.** Prototype ships
+  `SameSite=Lax` alone (blocks cross-site POST). **TODO before prod: add a
+  per-session HMAC CSRF token** in a hidden form field, verified on every
+  state-changing route.
+- **Deferred but unblocked:** LDAP/OIDC login buttons (6e), passwords (never),
+  triage views (6d), per-repo RBAC (6g), an audit-events page (needs a
+  `RecentAccessEvents` query, not yet written).
 
 ---
 

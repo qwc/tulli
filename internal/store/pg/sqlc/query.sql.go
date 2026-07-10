@@ -403,6 +403,42 @@ func (q *Queries) ListRepos(ctx context.Context) ([]ListReposRow, error) {
 	return items, nil
 }
 
+const listUsers = `-- name: ListUsers :many
+SELECT id, name, role, kind FROM users ORDER BY id
+`
+
+type ListUsersRow struct {
+	ID   int64
+	Name string
+	Role string
+	Kind string
+}
+
+func (q *Queries) ListUsers(ctx context.Context) ([]ListUsersRow, error) {
+	rows, err := q.db.Query(ctx, listUsers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUsersRow
+	for rows.Next() {
+		var i ListUsersRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Role,
+			&i.Kind,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const manualBlockRefs = `-- name: ManualBlockRefs :many
 SELECT DISTINCT ref FROM manual_blocks WHERE repo_id = $1
 `
@@ -494,6 +530,29 @@ type UserByFingerprintRow struct {
 func (q *Queries) UserByFingerprint(ctx context.Context, fingerprint string) (UserByFingerprintRow, error) {
 	row := q.db.QueryRow(ctx, userByFingerprint, fingerprint)
 	var i UserByFingerprintRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Role,
+		&i.Kind,
+	)
+	return i, err
+}
+
+const userByID = `-- name: UserByID :one
+SELECT id, name, role, kind FROM users WHERE id = $1
+`
+
+type UserByIDRow struct {
+	ID   int64
+	Name string
+	Role string
+	Kind string
+}
+
+func (q *Queries) UserByID(ctx context.Context, id int64) (UserByIDRow, error) {
+	row := q.db.QueryRow(ctx, userByID, id)
+	var i UserByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.Name,

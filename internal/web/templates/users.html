@@ -1,0 +1,63 @@
+{{define "content"}}
+<h1>Users</h1>
+
+{{if .Data.Error}}<div class="banner err">{{.Data.Error}}</div>{{end}}
+{{if .Data.MintedToken}}
+<div class="banner ok">
+  New token{{if .Data.MintedFor}} for <strong>{{.Data.MintedFor}}</strong>{{end}} — shown once, copy it now:
+  <br><code>{{.Data.MintedToken}}</code>
+</div>
+{{end}}
+
+<table>
+  <thead><tr><th>#</th><th>Login</th><th>Role</th><th>Kind</th><th>Token</th><th>Key</th></tr></thead>
+  <tbody>
+  {{range .Data.Users}}
+    <tr>
+      <td>{{.UserID}}</td>
+      <td>{{.Login}}</td>
+      <td><span class="badge role">{{.Role}}</span></td>
+      <td>{{.Kind}}</td>
+      <td>
+        <form method="post" action="/users/{{.UserID}}/tokens">
+          <input type="hidden" name="login" value="{{.Login}}">
+          <button type="submit">Mint token</button>
+        </form>
+      </td>
+      <td>
+        <form method="post" action="/users/{{.UserID}}/keys">
+          <input type="text" name="public_key" placeholder="ssh-ed25519 AAAA..." required>
+          <button type="submit">Add key</button>
+        </form>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+
+<fieldset>
+  <legend>Create a user</legend>
+  <form method="post" action="/users">
+    <div class="grid2">
+      <div>
+        <label>Login / name</label>
+        <input type="text" name="name" required>
+      </div>
+      <div>
+        <label>Role</label>
+        <select name="role">
+          <option value="viewer">viewer</option>
+          <option value="reviewer">reviewer</option>
+          <option value="admin">admin</option>
+        </select>
+      </div>
+    </div>
+    <label>Kind</label>
+    <select name="kind">
+      <option value="human">human</option>
+      <option value="robot">robot</option>
+    </select>
+    <p><button class="primary" type="submit">Create user</button></p>
+  </form>
+</fieldset>
+{{end}}

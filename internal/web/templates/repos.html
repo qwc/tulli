@@ -1,0 +1,28 @@
+{{define "content"}}
+<h1>Repositories</h1>
+{{if .Data.Repos}}
+<table>
+  <thead><tr><th>#</th><th>Mirror</th><th>Status</th></tr></thead>
+  <tbody>
+  {{range .Data.Repos}}
+    <tr>
+      <td><a href="/repos/{{.ID}}">{{.ID}}</a></td>
+      <td class="mono">{{.MirrorPath}}</td>
+      <td>
+        {{if .Blocked}}
+          <span class="badge bad">QUARANTINED</span>
+          {{if .Reason}}<span class="muted">{{.Reason}}</span>{{end}}
+        {{else if .HiddenRefs}}
+          <span class="badge bad">{{len .HiddenRefs}} ref(s) hidden</span>
+        {{else}}
+          <span class="badge clean">CLEAN</span>
+        {{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">No repositories mirrored yet. Clone one through the proxy to populate this list.</p>
+{{end}}
+{{end}}

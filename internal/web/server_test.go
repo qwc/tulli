@@ -23,7 +23,7 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 func newAPI(t *testing.T) (*httptest.Server, *store.Mem) {
 	t.Helper()
 	mem := store.NewMem()
-	srv := web.New(mem, auth.NewDBProvider(mem), adminTok, discardLogger())
+	srv := web.New(mem, auth.NewDBProvider(mem), adminTok, []byte("test-secret"), false, discardLogger())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, mem

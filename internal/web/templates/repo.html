@@ -1,0 +1,77 @@
+{{define "content"}}
+{{$edit := .Data.CanEdit}}
+<p><a href="/">&larr; all repos</a></p>
+<h1>Repository #{{.Data.ID}}</h1>
+
+{{if .Data.Error}}<div class="banner err">{{.Data.Error}}</div>{{end}}
+
+<p>
+  {{if .Data.Blocked}}
+    <span class="badge bad">QUARANTINED (repo-wide)</span>
+    {{if .Data.Reason}}<span class="muted">{{.Data.Reason}}</span>{{end}}
+  {{else if .Data.HiddenRefs}}
+    <span class="badge bad">Serving, {{len .Data.HiddenRefs}} ref(s) hidden</span>
+  {{else}}
+    <span class="badge clean">CLEAN</span>
+  {{end}}
+</p>
+
+{{if .Data.HiddenRefs}}
+<p class="muted">Hidden refs: {{range .Data.HiddenRefs}}<code>{{.}}</code> {{end}}</p>
+{{end}}
+
+<h2>Findings</h2>
+{{if .Data.Findings}}
+<table>
+  <thead><tr><th>Ref</th><th>Scanner</th><th>Severity</th><th>Rule</th><th>File</th><th>Commit</th>{{if $edit}}<th>Waive</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Data.Findings}}
+    <tr>
+      <td class="mono">{{if .Ref}}{{.Ref}}{{else}}(repo-wide){{end}}</td>
+      <td>{{.Scanner}}</td>
+      <td>{{if eq .Severity "HIGH"}}<span class="badge bad">{{.Severity}}</span>{{else}}{{.Severity}}{{end}}</td>
+      <td class="mono">{{.RuleID}}</td>
+      <td class="mono">{{.FilePath}}</td>
+      <td class="mono">{{short .Commit}}</td>
+      {{if $edit}}
+      <td>
+        <form method="post" action="/repos/{{$.Data.ID}}/overrides">
+          <input type="hidden" name="ref" value="{{.Ref}}">
+          <input type="hidden" name="fingerprint" value="{{.Fingerprint}}">
+          <input type="text" name="reason" placeholder="waiver reason" required>
+          <button type="submit">Override</button>
+        </form>
+      </td>
+      {{end}}
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">No findings recorded.</p>
+{{end}}
+
+{{if $edit}}
+<div class="grid2">
+  <fieldset>
+    <legend>Block a ref (or the whole repo)</legend>
+    <form method="post" action="/repos/{{.Data.ID}}/block">
+      <label>Ref <span class="muted">(leave empty for repo-wide)</span></label>
+      <input type="text" name="ref" placeholder="refs/heads/evil">
+      <label>Reason</label>
+      <input type="text" name="reason" required>
+      <p><button class="danger" type="submit">Block</button></p>
+    </form>
+  </fieldset>
+  <fieldset>
+    <legend>Lift a manual block</legend>
+    <form method="post" action="/repos/{{.Data.ID}}/unblock">
+      <label>Ref <span class="muted">(leave empty for repo-wide)</span></label>
+      <input type="text" name="ref" placeholder="refs/heads/evil">
+      <p><button type="submit">Unblock</button></p>
+    </form>
+  </fieldset>
+</div>
+<p class="muted">Writes are desired state; the reconciler applies them to the mirror on its next sweep.</p>
+{{end}}
+{{end}}

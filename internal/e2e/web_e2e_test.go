@@ -40,7 +40,7 @@ func TestE2E_WebBlockQuarantines(t *testing.T) {
 	}
 
 	// Web API over the same store (its own httptest server).
-	api := httptest.NewServer(web.New(s.st, auth.NewDBProvider(s.st), adminTok, discardLogger()).Handler())
+	api := httptest.NewServer(web.New(s.st, auth.NewDBProvider(s.st), adminTok, []byte("test-secret"), false, discardLogger()).Handler())
 	t.Cleanup(api.Close)
 
 	// A reviewer blocks the ref through the API (bootstrap admin authenticates).

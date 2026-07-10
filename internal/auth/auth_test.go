@@ -21,6 +21,14 @@ func (f *fakeStore) UserByTokenHash(_ context.Context, h string) (Identity, bool
 	id, ok := f.byHash[h]
 	return id, ok, nil
 }
+func (f *fakeStore) UserByID(_ context.Context, uid int64) (Identity, bool, error) {
+	for _, id := range f.byHash {
+		if id.UserID == uid {
+			return id, true, nil
+		}
+	}
+	return Identity{}, false, nil
+}
 
 func TestHashToken_StableAndDistinct(t *testing.T) {
 	a1 := HashToken("secret-token")
