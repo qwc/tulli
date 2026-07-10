@@ -317,6 +317,69 @@ func TestPG_DeepLaneVulnMatches(t *testing.T) {
 	}
 }
 
+// TestPG_TriageAndNotify exercises the 6d triage + notify store paths on real
+// Postgres: open a triage item and decide it; resolve recipients from the audit
+// trail; and record a quarantine notification once (idempotent per verdict).
+func TestPG_TriageAndNotify(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	repoID, _ := s.UpsertRepo(ctx, "https://github.com/o/app", "/m/app.git")
+	uid, _ := s.InsertUser(ctx, "alice", auth.RoleViewer, auth.KindHuman)
+	if err := s.InsertAccessEvent(ctx, core.Access{RepoID: repoID, UserID: uid, Status: 200}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a triage item (as the deep worker would).
+	scanID, _ := s.InsertTreeScan(ctx, repoID, "trivy", "refs/heads/main", "tip1")
+	vulnID, _ := s.UpsertVulnerability(ctx, "nvd", "CVE-2023-1111", nil, "CVE", "HIGH", "", "SSRF")
+	compID, _ := s.UpsertComponent(ctx, repoID, "refs/heads/main", "tip1", "pkg:pypi/requests@2.19.0", scanID)
+	matchID, _ := s.UpsertVulnMatch(ctx, compID, vulnID, scanID, "trivy", "CRITICAL", "2.20.0")
+	if err := s.OpenTriage(ctx, repoID, "refs/heads/main", matchID); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.ListPendingTriage(ctx)
+	if err != nil || len(items) != 1 || items[0].SourceID != "CVE-2023-1111" {
+		t.Fatalf("ListPendingTriage = %+v err=%v", items, err)
+	}
+	tid := items[0].TriageID
+	tRepo, tRef, tSource, ok, err := s.TriageByID(ctx, tid)
+	if err != nil || !ok || tRepo != repoID || tRef != "refs/heads/main" || tSource != "CVE-2023-1111" {
+		t.Fatalf("TriageByID = (%d,%q,%q,%v,%v)", tRepo, tRef, tSource, ok, err)
+	}
+	if err := s.SetTriageStatus(ctx, tid, "QUARANTINED", "rev", "exploitable"); err != nil {
+		t.Fatal(err)
+	}
+	if items, _ := s.ListPendingTriage(ctx); len(items) != 0 {
+		t.Fatalf("decided item still pending: %+v", items)
+	}
+
+	// Recipients from the audit trail.
+	rcs, err := s.RecipientsForRepo(ctx, repoID)
+	if err != nil || len(rcs) != 1 || rcs[0].Login != "alice" {
+		t.Fatalf("RecipientsForRepo = %+v err=%v", rcs, err)
+	}
+
+	// Notify once per quarantined verdict (idempotent).
+	if err := s.InsertVerdict(ctx, repoID, "refs/heads/main", "QUARANTINED", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.RecordNotificationForLatestVerdict(ctx, repoID, "refs/heads/main", []int64{uid}, "log:x")
+	if err != nil || !first {
+		t.Fatalf("first record = %v, %v; want true", first, err)
+	}
+	second, err := s.RecordNotificationForLatestVerdict(ctx, repoID, "refs/heads/main", []int64{uid}, "log:x")
+	if err != nil || second {
+		t.Fatalf("second record = %v, %v; want false (idempotent)", second, err)
+	}
+}
+
 // TestPG_ManualBlockSurvivesRecompute exercises verdict-provenance (Option B) on
 // real Postgres: a human block with NO backing finding must survive repeated
 // recompute sweeps (the latent clobber), enforce as a repo-wide block, and lift

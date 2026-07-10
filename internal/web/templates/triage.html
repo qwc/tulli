@@ -1,0 +1,36 @@
+{{define "content"}}
+<h1>Triage queue</h1>
+<p class="muted">Pending CVE matches awaiting a decision. Accept (risk accepted) or
+  dismiss (not applicable) just record the decision; quarantine also blocks the
+  ref via a manual block.</p>
+
+{{if .Data.Error}}<div class="banner err">{{.Data.Error}}</div>{{end}}
+
+{{if .Data.Items}}
+<table>
+  <thead><tr><th>Repo</th><th>Ref</th><th>Package</th><th>Advisory</th><th>Severity</th><th>Decision</th></tr></thead>
+  <tbody>
+  {{range .Data.Items}}
+    <tr>
+      <td class="mono"><a href="/repos/{{.RepoID}}">{{.Repo}}</a></td>
+      <td class="mono">{{if .Ref}}{{.Ref}}{{else}}(default){{end}}</td>
+      <td class="mono">{{.PURL}}</td>
+      <td class="mono">{{.SourceID}}</td>
+      <td>{{if eq .Severity "HIGH"}}<span class="badge bad">{{.Severity}}</span>{{else}}{{.Severity}}{{end}}</td>
+      <td>
+        <form method="post" action="/triage/{{.TriageID}}">
+          <input type="hidden" name="return" value="/triage">
+          <input type="text" name="note" placeholder="note (optional)" style="width:10rem">
+          <button name="decision" value="accept" type="submit">Accept</button>
+          <button name="decision" value="dismiss" type="submit">Dismiss</button>
+          <button class="danger" name="decision" value="quarantine" type="submit">Quarantine</button>
+        </form>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">Nothing pending. 🎉</p>
+{{end}}
+{{end}}

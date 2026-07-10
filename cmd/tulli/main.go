@@ -23,6 +23,7 @@ import (
 	"codeberg.org/qwc/tulli/internal/git"
 	"codeberg.org/qwc/tulli/internal/httpsrv"
 	"codeberg.org/qwc/tulli/internal/mirror"
+	"codeberg.org/qwc/tulli/internal/notify"
 	"codeberg.org/qwc/tulli/internal/scan"
 	"codeberg.org/qwc/tulli/internal/sshsrv"
 	"codeberg.org/qwc/tulli/internal/store"
@@ -125,7 +126,7 @@ func main() {
 	// Reconciler (mirror-owning process): applies DB verdicts to on-disk hideRefs;
 	// its periodic sweep also recomputes verdicts written out of process (the
 	// future web API). Scan worker: fail-open-once gitleaks off the request path.
-	reconciler := mirror.NewReconciler(st, log)
+	reconciler := mirror.NewReconciler(st, log).WithNotifier(notify.NewLogNotifier(log))
 	worker := scan.NewWorker(scan.NewGitleaks(), st, git.RefsContaining, reconciler, log)
 	go worker.Run(ctx)
 	go reconciler.Run(ctx, *reconcile)

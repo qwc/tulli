@@ -9,9 +9,19 @@ import (
 	"strings"
 	"testing"
 
+	"codeberg.org/qwc/tulli/internal/core"
+	"codeberg.org/qwc/tulli/internal/notify"
 	"codeberg.org/qwc/tulli/internal/store"
 	"codeberg.org/qwc/tulli/internal/verdict"
 )
+
+// captureNotifier records delivered notices.
+type captureNotifier struct{ notices []notify.Notice }
+
+func (c *captureNotifier) Deliver(_ context.Context, n notify.Notice) error {
+	c.notices = append(c.notices, n)
+	return nil
+}
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
@@ -66,6 +76,46 @@ func TestReconcileRepo_AppliesAndClearsHideRefs(t *testing.T) {
 	}
 	if got := hiddenRefs(t, repo); got != nil {
 		t.Fatalf("hidden = %v, want none after un-quarantine", got)
+	}
+}
+
+// A newly-quarantined ref notifies whoever pulled the repo, exactly once — the
+// notifications table makes a repeated reconcile idempotent (spec §6d).
+func TestReconcile_NotifiesOncePerQuarantine(t *testing.T) {
+	repo := makeBareRepo(t)
+	st := store.NewMem()
+	ctx := context.Background()
+	id, _ := st.UpsertRepo(ctx, "https://h/o/r", repo)
+
+	// alice pulled the repo (audit trail → notify recipient).
+	uid, _ := st.InsertUser(ctx, "alice", "viewer", "human")
+	_ = st.InsertAccessEvent(ctx, core.Access{RepoID: id, UserID: uid, Status: 200})
+
+	cap := &captureNotifier{}
+	r := NewReconciler(st, discardLogger()).WithNotifier(cap)
+
+	// Quarantine a ref, reconcile → one notice to alice.
+	st.SetVerdict(id, "refs/heads/evil", verdict.DecisionQuarantined, "secret")
+	if err := r.ReconcileRepo(ctx, id, repo); err != nil {
+		t.Fatal(err)
+	}
+	if len(cap.notices) != 1 {
+		t.Fatalf("got %d notices, want 1", len(cap.notices))
+	}
+	n := cap.notices[0]
+	if n.RepoWide || len(n.Refs) != 1 || n.Refs[0] != "refs/heads/evil" {
+		t.Fatalf("notice scope = %+v", n)
+	}
+	if len(n.Recipients) != 1 || n.Recipients[0].Login != "alice" {
+		t.Fatalf("recipients = %+v, want [alice]", n.Recipients)
+	}
+
+	// Reconcile again (e.g. the periodic sweep) → no second notice.
+	if err := r.ReconcileRepo(ctx, id, repo); err != nil {
+		t.Fatal(err)
+	}
+	if len(cap.notices) != 1 {
+		t.Fatalf("got %d notices after re-reconcile, want still 1 (idempotent)", len(cap.notices))
 	}
 }
 

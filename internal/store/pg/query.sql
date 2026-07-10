@@ -81,8 +81,8 @@ WHERE NOT EXISTS (SELECT 1 FROM triage WHERE match_id = $2);
 
 -- name: VulnMatchesForRepo :many
 -- Read model for the repo detail page: every CVE match with its package, advisory
--- and current triage status (spec §8.5). Newest first.
-SELECT c.ref, c.purl, v.source, v.source_id, v.severity, v.summary,
+-- and current triage status/id (spec §8.5, §6d). Newest first.
+SELECT COALESCE(tr.id, 0) AS triage_id, c.ref, c.purl, v.source, v.source_id, v.severity, v.summary,
        m.tool_severity, m.fixed_version, COALESCE(tr.status, 'PENDING') AS triage_status
 FROM vuln_matches m
 JOIN components c ON c.id = m.component_id
@@ -90,6 +90,52 @@ JOIN vulnerabilities v ON v.id = m.vuln_id
 LEFT JOIN triage tr ON tr.match_id = m.id
 WHERE c.repo_id = $1
 ORDER BY m.last_seen DESC;
+
+-- name: ListPendingTriage :many
+-- The triage queue (spec §6d): every PENDING CVE match with enough context to
+-- decide and to block.
+SELECT tr.id AS triage_id, tr.repo_id, r.mirror_path, tr.ref, c.purl, v.source_id, v.severity
+FROM triage tr
+JOIN vuln_matches m ON m.id = tr.match_id
+JOIN components c ON c.id = m.component_id
+JOIN vulnerabilities v ON v.id = m.vuln_id
+JOIN repos r ON r.id = tr.repo_id
+WHERE tr.status = 'PENDING'
+ORDER BY tr.id DESC;
+
+-- name: TriageByID :one
+-- Authoritative block target for a triage decision (spec §6d).
+SELECT tr.repo_id, tr.ref, v.source_id
+FROM triage tr
+JOIN vuln_matches m ON m.id = tr.match_id
+JOIN vulnerabilities v ON v.id = m.vuln_id
+WHERE tr.id = $1;
+
+-- name: SetTriageStatus :exec
+UPDATE triage SET status = $2, reviewer = $3, note = sqlc.narg('note'), decided_at = NOW()
+WHERE id = $1;
+
+-- name: RecipientsForRepo :many
+-- Who to notify: the distinct authenticated users who pulled this repo (spec §6d,
+-- repo-precise — ref-level pull attribution needs upload-pack want-parsing).
+SELECT DISTINCT a.user_id, u.name
+FROM access_events a JOIN users u ON u.id = a.user_id
+WHERE a.repo_id = $1 AND a.user_id IS NOT NULL;
+
+-- name: RecordNotificationForLatestVerdict :one
+-- Idempotently record a notification against the latest verdict for (repo, ref):
+-- inserts only if no notification exists for that verdict yet, so the reconciler
+-- sweep never re-notifies (spec §6d). Returns the new row id (0 rows = already
+-- notified).
+INSERT INTO notifications (verdict_id, recipients, payload_path)
+SELECT lv.id, sqlc.arg('recipients')::bigint[], sqlc.arg('payload_path')
+FROM (
+  SELECT id FROM verdicts
+  WHERE repo_id = sqlc.arg('repo_id') AND ref IS NOT DISTINCT FROM sqlc.narg('ref') AND decision = 'QUARANTINED'
+  ORDER BY decided_at DESC LIMIT 1
+) lv
+WHERE NOT EXISTS (SELECT 1 FROM notifications n WHERE n.verdict_id = lv.id)
+RETURNING id;
 
 -- name: InsertFinding :exec
 INSERT INTO findings

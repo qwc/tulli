@@ -277,13 +277,79 @@ func (s *Store) VulnMatchesForRepo(ctx context.Context, repoID int64) ([]core.Vu
 	out := make([]core.VulnMatch, len(rows))
 	for i, r := range rows {
 		out[i] = core.VulnMatch{
-			Ref: str(r.Ref), PURL: r.Purl, Source: r.Source, SourceID: r.SourceID,
+			TriageID: r.TriageID, Ref: str(r.Ref), PURL: r.Purl, Source: r.Source, SourceID: r.SourceID,
 			Severity: str(r.Severity), Summary: str(r.Summary),
 			ToolSeverity: str(r.ToolSeverity), FixedVersion: str(r.FixedVersion),
 			TriageStatus: r.TriageStatus,
 		}
 	}
 	return out, nil
+}
+
+// --- Stage 6d: triage + notify ---
+
+func (s *Store) ListPendingTriage(ctx context.Context) ([]core.TriageItem, error) {
+	rows, err := s.q.ListPendingTriage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.TriageItem, len(rows))
+	for i, r := range rows {
+		out[i] = core.TriageItem{
+			TriageID: r.TriageID, RepoID: r.RepoID, Repo: r.MirrorPath,
+			Ref: str(r.Ref), PURL: r.Purl, SourceID: r.SourceID, Severity: str(r.Severity),
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) TriageByID(ctx context.Context, triageID int64) (repoID int64, ref, sourceID string, ok bool, err error) {
+	r, err := s.q.TriageByID(ctx, triageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "", "", false, nil
+	}
+	if err != nil {
+		return 0, "", "", false, err
+	}
+	return r.RepoID, str(r.Ref), r.SourceID, true, nil
+}
+
+func (s *Store) SetTriageStatus(ctx context.Context, triageID int64, status, reviewer, note string) error {
+	return s.q.SetTriageStatus(ctx, sqlc.SetTriageStatusParams{
+		ID: triageID, Status: status, Reviewer: ptr(reviewer), Note: ptr(note),
+	})
+}
+
+func (s *Store) RecipientsForRepo(ctx context.Context, repoID int64) ([]core.Recipient, error) {
+	rows, err := s.q.RecipientsForRepo(ctx, &repoID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.Recipient, 0, len(rows))
+	for _, r := range rows {
+		var uid int64
+		if r.UserID != nil {
+			uid = *r.UserID
+		}
+		out = append(out, core.Recipient{UserID: uid, Login: r.Name})
+	}
+	return out, nil
+}
+
+func (s *Store) RecordNotificationForLatestVerdict(ctx context.Context, repoID int64, ref string, recipients []int64, payloadPath string) (bool, error) {
+	if recipients == nil {
+		recipients = []int64{}
+	}
+	_, err := s.q.RecordNotificationForLatestVerdict(ctx, sqlc.RecordNotificationForLatestVerdictParams{
+		RepoID: repoID, Ref: ptr(ref), Recipients: recipients, PayloadPath: payloadPath,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // already notified for this verdict, or no quarantined verdict
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // --- Stage 6a: identity & access (auth.Store) ---

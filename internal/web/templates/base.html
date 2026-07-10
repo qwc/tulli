@@ -50,6 +50,7 @@
   {{if .Me.Login}}
   <nav>
     <a href="/">Repos</a>
+    {{if canReview .Me.Role}}<a href="/triage">Triage</a>{{end}}
     <a href="/account">Account</a>
     {{if canAdmin .Me.Role}}<a href="/users">Users</a>{{end}}
   </nav>

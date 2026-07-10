@@ -7,8 +7,11 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+
+	"codeberg.org/qwc/tulli/internal/store"
 )
 
 // noRedirect is an http.Client that captures a redirect response instead of
@@ -153,6 +156,67 @@ func TestUI_LogoutClearsSession(t *testing.T) {
 		t.Fatalf("post-logout GET / = %d, want 303 (session cleared)", code)
 	}
 }
+
+// seedTriageItem creates a repo with one PENDING CVE triage row and returns
+// (repoID, triageID) — mirrors what the DeepWorker produces.
+func seedTriageItem(t *testing.T, mem *store.Mem) (int64, int64) {
+	t.Helper()
+	ctx := context.Background()
+	repoID, _ := mem.UpsertRepo(ctx, "https://h/o/app", "/m/app.git")
+	scanID, _ := mem.InsertTreeScan(ctx, repoID, "trivy", "refs/heads/main", "tip1")
+	vulnID, _ := mem.UpsertVulnerability(ctx, "nvd", "CVE-2023-1111", nil, "CVE", "HIGH", "", "SSRF")
+	compID, _ := mem.UpsertComponent(ctx, repoID, "refs/heads/main", "tip1", "pkg:pypi/requests@2.19.0", scanID)
+	matchID, _ := mem.UpsertVulnMatch(ctx, compID, vulnID, scanID, "trivy", "CRITICAL", "2.20.0")
+	_ = mem.OpenTriage(ctx, repoID, "refs/heads/main", matchID)
+	items, _ := mem.ListPendingTriage(ctx)
+	if len(items) != 1 {
+		t.Fatalf("seed: got %d pending items, want 1", len(items))
+	}
+	return repoID, items[0].TriageID
+}
+
+func TestUI_TriageQuarantineWritesBlock(t *testing.T) {
+	ts, mem := newAPI(t)
+	ctx := context.Background()
+	repoID, triageID := seedTriageItem(t, mem)
+	_, tok := mkUser(t, ts, "rev", "reviewer", "human")
+	c := browserLogin(t, ts, tok)
+
+	// Queue page lists the pending item.
+	if code, body := getBody(t, c, ts.URL+"/triage"); code != 200 || !strings.Contains(body, "CVE-2023-1111") {
+		t.Fatalf("triage queue = %d, missing item\n%s", code, body)
+	}
+
+	// Quarantine decision → 303, records a manual block on the ref.
+	resp, err := c.PostForm(ts.URL+"/triage/"+itoa(triageID),
+		url.Values{"decision": {"quarantine"}, "note": {"exploitable"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("quarantine = %d, want 303", resp.StatusCode)
+	}
+	active, reason, _ := mem.ActiveManualBlock(ctx, repoID, "refs/heads/main")
+	if !active || !strings.Contains(reason, "CVE-2023-1111") {
+		t.Fatalf("manual block = (%v, %q), want active with the CVE id", active, reason)
+	}
+	// Item leaves the PENDING queue.
+	if items, _ := mem.ListPendingTriage(ctx); len(items) != 0 {
+		t.Fatalf("queue still has %d items after decision", len(items))
+	}
+}
+
+func TestUI_TriageViewerForbidden(t *testing.T) {
+	ts, _ := newAPI(t)
+	_, tok := mkUser(t, ts, "v", "viewer", "human")
+	c := browserLogin(t, ts, tok)
+	if code, _ := getBody(t, c, ts.URL+"/triage"); code != http.StatusForbidden {
+		t.Fatalf("viewer /triage = %d, want 403", code)
+	}
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 func TestUI_AdminOnlyUsersPage(t *testing.T) {
 	ts, _ := newAPI(t)

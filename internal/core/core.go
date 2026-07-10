@@ -43,8 +43,10 @@ type Access struct {
 
 // VulnMatch is the read model for a CVE match on a repo (spec §8.5): a package
 // (PURL) affected by an advisory, with its current triage status. Purely
-// informational — CVE matches never gate (§6.6).
+// informational — CVE matches never gate (§6.6). TriageID is the triage row to
+// act on (§6d).
 type VulnMatch struct {
+	TriageID     int64
 	Ref          string
 	PURL         string
 	Source       string
@@ -54,6 +56,24 @@ type VulnMatch struct {
 	ToolSeverity string
 	FixedVersion string
 	TriageStatus string
+}
+
+// TriageItem is one PENDING triage row for the queue view (§6d): a CVE match
+// awaiting a human decision, with enough context to act on and to block.
+type TriageItem struct {
+	TriageID int64
+	RepoID   int64
+	Repo     string // mirror path (display)
+	Ref      string
+	PURL     string
+	SourceID string
+	Severity string
+}
+
+// Recipient is a user to notify, resolved from the audit trail (§6d).
+type Recipient struct {
+	UserID int64
+	Login  string
 }
 
 // Mirror is the seam onto lazy mirroring (implemented by internal/git.Mirror).

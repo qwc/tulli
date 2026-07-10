@@ -54,8 +54,12 @@ type Store interface {
 	UserByID(ctx context.Context, userID int64) (auth.Identity, bool, error)
 	// ListUsers backs the admin users view.
 	ListUsers(ctx context.Context) ([]auth.Identity, error)
-	// VulnMatchesForRepo backs the (read-only) CVE section of the repo page.
+	// VulnMatchesForRepo backs the CVE section of the repo page.
 	VulnMatchesForRepo(ctx context.Context, repoID int64) ([]core.VulnMatch, error)
+	// Triage (§6d).
+	ListPendingTriage(ctx context.Context) ([]core.TriageItem, error)
+	TriageByID(ctx context.Context, triageID int64) (repoID int64, ref, sourceID string, ok bool, err error)
+	SetTriageStatus(ctx context.Context, triageID int64, status, reviewer, note string) error
 }
 
 type Server struct {
@@ -111,6 +115,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /repos/{id}/overrides", s.guardHTML(auth.RoleReviewer, s.htmlOverride))
 	mux.HandleFunc("GET /account", s.guardHTML(auth.RoleViewer, s.accountPage))
 	mux.HandleFunc("POST /account/keys", s.guardHTML(auth.RoleViewer, s.accountAddKey))
+	mux.HandleFunc("GET /triage", s.guardHTML(auth.RoleReviewer, s.triagePage))
+	mux.HandleFunc("POST /triage/{id}", s.guardHTML(auth.RoleReviewer, s.triageDecide))
 	mux.HandleFunc("GET /users", s.guardHTML(auth.RoleAdmin, s.usersPage))
 	mux.HandleFunc("POST /users", s.guardHTML(auth.RoleAdmin, s.usersCreate))
 	mux.HandleFunc("POST /users/{id}/tokens", s.guardHTML(auth.RoleAdmin, s.usersMintToken))
@@ -260,6 +266,7 @@ type findingView struct {
 
 // vulnView is one CVE match on the repo page — informational, never gating.
 type vulnView struct {
+	TriageID     int64  `json:"triage_id"`
 	Ref          string `json:"ref"`
 	PURL         string `json:"purl"`
 	Source       string `json:"source"`
@@ -321,7 +328,7 @@ func (s *Server) buildRepoDetail(ctx context.Context, id int64) (repoDetail, err
 	vulns := make([]vulnView, 0, len(vms))
 	for _, m := range vms {
 		vulns = append(vulns, vulnView{
-			Ref: m.Ref, PURL: m.PURL, Source: m.Source, SourceID: m.SourceID,
+			TriageID: m.TriageID, Ref: m.Ref, PURL: m.PURL, Source: m.Source, SourceID: m.SourceID,
 			Severity: m.Severity, Summary: m.Summary, ToolSeverity: m.ToolSeverity,
 			FixedVersion: m.FixedVersion, TriageStatus: m.TriageStatus,
 		})

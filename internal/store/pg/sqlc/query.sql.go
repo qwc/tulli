@@ -400,6 +400,57 @@ func (q *Queries) InsertVerdict(ctx context.Context, arg InsertVerdictParams) er
 	return err
 }
 
+const listPendingTriage = `-- name: ListPendingTriage :many
+SELECT tr.id AS triage_id, tr.repo_id, r.mirror_path, tr.ref, c.purl, v.source_id, v.severity
+FROM triage tr
+JOIN vuln_matches m ON m.id = tr.match_id
+JOIN components c ON c.id = m.component_id
+JOIN vulnerabilities v ON v.id = m.vuln_id
+JOIN repos r ON r.id = tr.repo_id
+WHERE tr.status = 'PENDING'
+ORDER BY tr.id DESC
+`
+
+type ListPendingTriageRow struct {
+	TriageID   int64
+	RepoID     int64
+	MirrorPath string
+	Ref        *string
+	Purl       string
+	SourceID   string
+	Severity   *string
+}
+
+// The triage queue (spec §6d): every PENDING CVE match with enough context to
+// decide and to block.
+func (q *Queries) ListPendingTriage(ctx context.Context) ([]ListPendingTriageRow, error) {
+	rows, err := q.db.Query(ctx, listPendingTriage)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPendingTriageRow
+	for rows.Next() {
+		var i ListPendingTriageRow
+		if err := rows.Scan(
+			&i.TriageID,
+			&i.RepoID,
+			&i.MirrorPath,
+			&i.Ref,
+			&i.Purl,
+			&i.SourceID,
+			&i.Severity,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRepos = `-- name: ListRepos :many
 SELECT id, mirror_path FROM repos
 `
@@ -538,6 +589,118 @@ func (q *Queries) OverriddenFingerprints(ctx context.Context, arg OverriddenFing
 		return nil, err
 	}
 	return items, nil
+}
+
+const recipientsForRepo = `-- name: RecipientsForRepo :many
+SELECT DISTINCT a.user_id, u.name
+FROM access_events a JOIN users u ON u.id = a.user_id
+WHERE a.repo_id = $1 AND a.user_id IS NOT NULL
+`
+
+type RecipientsForRepoRow struct {
+	UserID *int64
+	Name   string
+}
+
+// Who to notify: the distinct authenticated users who pulled this repo (spec §6d,
+// repo-precise — ref-level pull attribution needs upload-pack want-parsing).
+func (q *Queries) RecipientsForRepo(ctx context.Context, repoID *int64) ([]RecipientsForRepoRow, error) {
+	rows, err := q.db.Query(ctx, recipientsForRepo, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RecipientsForRepoRow
+	for rows.Next() {
+		var i RecipientsForRepoRow
+		if err := rows.Scan(&i.UserID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const recordNotificationForLatestVerdict = `-- name: RecordNotificationForLatestVerdict :one
+INSERT INTO notifications (verdict_id, recipients, payload_path)
+SELECT lv.id, $1::bigint[], $2
+FROM (
+  SELECT id FROM verdicts
+  WHERE repo_id = $3 AND ref IS NOT DISTINCT FROM $4 AND decision = 'QUARANTINED'
+  ORDER BY decided_at DESC LIMIT 1
+) lv
+WHERE NOT EXISTS (SELECT 1 FROM notifications n WHERE n.verdict_id = lv.id)
+RETURNING id
+`
+
+type RecordNotificationForLatestVerdictParams struct {
+	Recipients  []int64
+	PayloadPath string
+	RepoID      int64
+	Ref         *string
+}
+
+// Idempotently record a notification against the latest verdict for (repo, ref):
+// inserts only if no notification exists for that verdict yet, so the reconciler
+// sweep never re-notifies (spec §6d). Returns the new row id (0 rows = already
+// notified).
+func (q *Queries) RecordNotificationForLatestVerdict(ctx context.Context, arg RecordNotificationForLatestVerdictParams) (int64, error) {
+	row := q.db.QueryRow(ctx, recordNotificationForLatestVerdict,
+		arg.Recipients,
+		arg.PayloadPath,
+		arg.RepoID,
+		arg.Ref,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const setTriageStatus = `-- name: SetTriageStatus :exec
+UPDATE triage SET status = $2, reviewer = $3, note = $4, decided_at = NOW()
+WHERE id = $1
+`
+
+type SetTriageStatusParams struct {
+	ID       int64
+	Status   string
+	Reviewer *string
+	Note     *string
+}
+
+func (q *Queries) SetTriageStatus(ctx context.Context, arg SetTriageStatusParams) error {
+	_, err := q.db.Exec(ctx, setTriageStatus,
+		arg.ID,
+		arg.Status,
+		arg.Reviewer,
+		arg.Note,
+	)
+	return err
+}
+
+const triageByID = `-- name: TriageByID :one
+SELECT tr.repo_id, tr.ref, v.source_id
+FROM triage tr
+JOIN vuln_matches m ON m.id = tr.match_id
+JOIN vulnerabilities v ON v.id = m.vuln_id
+WHERE tr.id = $1
+`
+
+type TriageByIDRow struct {
+	RepoID   int64
+	Ref      *string
+	SourceID string
+}
+
+// Authoritative block target for a triage decision (spec §6d).
+func (q *Queries) TriageByID(ctx context.Context, id int64) (TriageByIDRow, error) {
+	row := q.db.QueryRow(ctx, triageByID, id)
+	var i TriageByIDRow
+	err := row.Scan(&i.RepoID, &i.Ref, &i.SourceID)
+	return i, err
 }
 
 const upsertComponent = `-- name: UpsertComponent :one
@@ -728,7 +891,7 @@ func (q *Queries) UserByTokenHash(ctx context.Context, tokenHash string) (UserBy
 }
 
 const vulnMatchesForRepo = `-- name: VulnMatchesForRepo :many
-SELECT c.ref, c.purl, v.source, v.source_id, v.severity, v.summary,
+SELECT COALESCE(tr.id, 0) AS triage_id, c.ref, c.purl, v.source, v.source_id, v.severity, v.summary,
        m.tool_severity, m.fixed_version, COALESCE(tr.status, 'PENDING') AS triage_status
 FROM vuln_matches m
 JOIN components c ON c.id = m.component_id
@@ -739,6 +902,7 @@ ORDER BY m.last_seen DESC
 `
 
 type VulnMatchesForRepoRow struct {
+	TriageID     int64
 	Ref          *string
 	Purl         string
 	Source       string
@@ -751,7 +915,7 @@ type VulnMatchesForRepoRow struct {
 }
 
 // Read model for the repo detail page: every CVE match with its package, advisory
-// and current triage status (spec §8.5). Newest first.
+// and current triage status/id (spec §8.5, §6d). Newest first.
 func (q *Queries) VulnMatchesForRepo(ctx context.Context, repoID int64) ([]VulnMatchesForRepoRow, error) {
 	rows, err := q.db.Query(ctx, vulnMatchesForRepo, repoID)
 	if err != nil {
@@ -762,6 +926,7 @@ func (q *Queries) VulnMatchesForRepo(ctx context.Context, repoID int64) ([]VulnM
 	for rows.Next() {
 		var i VulnMatchesForRepoRow
 		if err := rows.Scan(
+			&i.TriageID,
 			&i.Ref,
 			&i.Purl,
 			&i.Source,

@@ -33,17 +33,21 @@ type Mem struct {
 	tokens   map[string]int64        // token_hash -> user_id
 	nextUser int64
 
-	// Deep lane (SBOM / CVE) — spec §8.5.
-	vulns     map[string]int64 // "source|source_id" -> vuln id
-	vulnByID  map[int64]memVuln
-	comps     map[string]int64 // "repo|tip|purl" -> component id
-	compByID  map[int64]memComp
-	matches   map[string]int64 // "comp|vuln" -> match id
-	matchByID map[int64]memMatch
-	triage    map[int64]string // match id -> triage status
-	nextVuln  int64
-	nextComp  int64
-	nextMatch int64
+	// Deep lane (SBOM / CVE) — spec §8.5, triage/notify §6d.
+	vulns         map[string]int64 // "source|source_id" -> vuln id
+	vulnByID      map[int64]memVuln
+	comps         map[string]int64 // "repo|tip|purl" -> component id
+	compByID      map[int64]memComp
+	matches       map[string]int64 // "comp|vuln" -> match id
+	matchByID     map[int64]memMatch
+	triageByMatch map[int64]int64     // match id -> triage id
+	triageByID    map[int64]memTriage // triage id -> row
+	notified      map[int64]bool      // verdict id -> already notified
+	nextVuln      int64
+	nextComp      int64
+	nextMatch     int64
+	nextTriage    int64
+	nextVerdict   int64
 }
 
 type memVuln struct{ source, sourceID, severity, summary string }
@@ -55,10 +59,17 @@ type memMatch struct {
 	compID, vulnID         int64
 	toolSeverity, fixedVer string
 }
+type memTriage struct {
+	repoID         int64
+	ref, status    string
+	matchID        int64
+	reviewer, note string
+}
 
 // memVerdict mirrors a row of the verdicts table (spec §9). ref == "" is a
 // repo-wide verdict (SQL NULL).
 type memVerdict struct {
+	id       int64
 	ref      string
 	decision string
 	reason   string
@@ -84,22 +95,24 @@ type memManualBlock struct {
 
 func NewMem() *Mem {
 	return &Mem{
-		repos:     make(map[string]int64),
-		paths:     make(map[int64]string),
-		verdicts:  make(map[int64][]memVerdict),
-		findings:  make(map[int64][]memFinding),
-		overrides: make(map[int64][]memOverride),
-		blocks:    make(map[int64][]memManualBlock),
-		users:     make(map[int64]auth.Identity),
-		sshKeys:   make(map[string]int64),
-		tokens:    make(map[string]int64),
-		vulns:     make(map[string]int64),
-		vulnByID:  make(map[int64]memVuln),
-		comps:     make(map[string]int64),
-		compByID:  make(map[int64]memComp),
-		matches:   make(map[string]int64),
-		matchByID: make(map[int64]memMatch),
-		triage:    make(map[int64]string),
+		repos:         make(map[string]int64),
+		paths:         make(map[int64]string),
+		verdicts:      make(map[int64][]memVerdict),
+		findings:      make(map[int64][]memFinding),
+		overrides:     make(map[int64][]memOverride),
+		blocks:        make(map[int64][]memManualBlock),
+		users:         make(map[int64]auth.Identity),
+		sshKeys:       make(map[string]int64),
+		tokens:        make(map[string]int64),
+		vulns:         make(map[string]int64),
+		vulnByID:      make(map[int64]memVuln),
+		comps:         make(map[string]int64),
+		compByID:      make(map[int64]memComp),
+		matches:       make(map[string]int64),
+		matchByID:     make(map[int64]memMatch),
+		triageByMatch: make(map[int64]int64),
+		triageByID:    make(map[int64]memTriage),
+		notified:      make(map[int64]bool),
 	}
 }
 
@@ -128,7 +141,8 @@ func (m *Mem) InsertAccessEvent(_ context.Context, a core.Access) error {
 func (m *Mem) SetVerdict(repoID int64, ref, decision, reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.verdicts[repoID] = append(m.verdicts[repoID], memVerdict{ref: ref, decision: decision, reason: reason})
+	m.nextVerdict++
+	m.verdicts[repoID] = append(m.verdicts[repoID], memVerdict{id: m.nextVerdict, ref: ref, decision: decision, reason: reason})
 }
 
 // ResolveVerdict applies the most-specific-wins resolver (spec §6.3) over the
@@ -168,7 +182,8 @@ func (m *Mem) ResolveVerdict(_ context.Context, repoID int64) (core.Verdict, err
 func (m *Mem) InsertVerdict(_ context.Context, repoID int64, ref, decision, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.verdicts[repoID] = append(m.verdicts[repoID], memVerdict{ref: ref, decision: decision, reason: reason})
+	m.nextVerdict++
+	m.verdicts[repoID] = append(m.verdicts[repoID], memVerdict{id: m.nextVerdict, ref: ref, decision: decision, reason: reason})
 	return nil
 }
 
@@ -418,12 +433,15 @@ func (m *Mem) UpsertVulnMatch(_ context.Context, componentID, vulnID, _ int64, _
 	return id, nil
 }
 
-func (m *Mem) OpenTriage(_ context.Context, _ int64, _ string, matchID int64) error {
+func (m *Mem) OpenTriage(_ context.Context, repoID int64, ref string, matchID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.triage[matchID]; !ok {
-		m.triage[matchID] = "PENDING"
+	if _, ok := m.triageByMatch[matchID]; ok {
+		return nil // already opened
 	}
+	m.nextTriage++
+	m.triageByMatch[matchID] = m.nextTriage
+	m.triageByID[m.nextTriage] = memTriage{repoID: repoID, ref: ref, status: "PENDING", matchID: matchID}
 	return nil
 }
 
@@ -437,18 +455,99 @@ func (m *Mem) VulnMatchesForRepo(_ context.Context, repoID int64) ([]core.VulnMa
 			continue
 		}
 		v := m.vulnByID[mm.vulnID]
-		status := m.triage[mid]
-		if status == "" {
-			status = "PENDING"
+		status := "PENDING"
+		var triageID int64
+		if tid, ok := m.triageByMatch[mid]; ok {
+			triageID = tid
+			status = m.triageByID[tid].status
 		}
 		out = append(out, core.VulnMatch{
-			Ref: comp.ref, PURL: comp.purl, Source: v.source, SourceID: v.sourceID,
+			TriageID: triageID, Ref: comp.ref, PURL: comp.purl, Source: v.source, SourceID: v.sourceID,
 			Severity: v.severity, Summary: v.summary,
 			ToolSeverity: mm.toolSeverity, FixedVersion: mm.fixedVer, TriageStatus: status,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SourceID < out[j].SourceID })
 	return out, nil
+}
+
+// --- Stage 6d: triage + notify ---
+
+func (m *Mem) ListPendingTriage(_ context.Context) ([]core.TriageItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []core.TriageItem
+	for tid, tr := range m.triageByID {
+		if tr.status != "PENDING" {
+			continue
+		}
+		mm := m.matchByID[tr.matchID]
+		v := m.vulnByID[mm.vulnID]
+		out = append(out, core.TriageItem{
+			TriageID: tid, RepoID: tr.repoID, Repo: m.paths[tr.repoID],
+			Ref: tr.ref, PURL: m.compByID[mm.compID].purl, SourceID: v.sourceID, Severity: v.severity,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TriageID > out[j].TriageID })
+	return out, nil
+}
+
+func (m *Mem) TriageByID(_ context.Context, triageID int64) (int64, string, string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tr, ok := m.triageByID[triageID]
+	if !ok {
+		return 0, "", "", false, nil
+	}
+	sourceID := m.vulnByID[m.matchByID[tr.matchID].vulnID].sourceID
+	return tr.repoID, tr.ref, sourceID, true, nil
+}
+
+func (m *Mem) SetTriageStatus(_ context.Context, triageID int64, status, reviewer, note string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if tr, ok := m.triageByID[triageID]; ok {
+		tr.status = status
+		tr.reviewer = reviewer
+		tr.note = note
+		m.triageByID[triageID] = tr
+	}
+	return nil
+}
+
+func (m *Mem) RecipientsForRepo(_ context.Context, repoID int64) ([]core.Recipient, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[int64]bool{}
+	var out []core.Recipient
+	for _, e := range m.events {
+		if e.RepoID != repoID || e.UserID == 0 || seen[e.UserID] {
+			continue
+		}
+		seen[e.UserID] = true
+		out = append(out, core.Recipient{UserID: e.UserID, Login: m.users[e.UserID].Login})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
+	return out, nil
+}
+
+func (m *Mem) RecordNotificationForLatestVerdict(_ context.Context, repoID int64, ref string, _ []int64, _ string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Newest QUARANTINED verdict row for (repo, ref) — mirrors the SQL subquery.
+	var vid int64
+	rows := m.verdicts[repoID]
+	for i := len(rows) - 1; i >= 0; i-- {
+		if rows[i].ref == ref && rows[i].decision == "QUARANTINED" {
+			vid = rows[i].id
+			break
+		}
+	}
+	if vid == 0 || m.notified[vid] {
+		return false, nil
+	}
+	m.notified[vid] = true
+	return true, nil
 }
 
 // Events returns a copy of the recorded access events (for tests/inspection).

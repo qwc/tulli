@@ -54,7 +54,7 @@
 <h2>Vulnerabilities <span class="muted" style="font-weight:400">(informational — these do not block; triage arrives in a later stage)</span></h2>
 {{if .Data.Vulns}}
 <table>
-  <thead><tr><th>Ref</th><th>Package</th><th>Advisory</th><th>Severity</th><th>Fixed in</th><th>Triage</th></tr></thead>
+  <thead><tr><th>Ref</th><th>Package</th><th>Advisory</th><th>Severity</th><th>Fixed in</th><th>Triage</th>{{if $edit}}<th>Decide</th>{{end}}</tr></thead>
   <tbody>
   {{range .Data.Vulns}}
     <tr>
@@ -64,6 +64,18 @@
       <td>{{if eq .Severity "HIGH"}}<span class="badge bad">{{.Severity}}</span>{{else}}{{.Severity}}{{end}}</td>
       <td class="mono">{{if .FixedVersion}}{{.FixedVersion}}{{else}}—{{end}}</td>
       <td><span class="badge role">{{.TriageStatus}}</span></td>
+      {{if $edit}}
+      <td>
+        {{if and .TriageID (eq .TriageStatus "PENDING")}}
+        <form method="post" action="/triage/{{.TriageID}}">
+          <input type="hidden" name="return" value="/repos/{{$.Data.ID}}">
+          <button name="decision" value="accept" type="submit">Accept</button>
+          <button name="decision" value="dismiss" type="submit">Dismiss</button>
+          <button class="danger" name="decision" value="quarantine" type="submit">Quarantine</button>
+        </form>
+        {{else}}—{{end}}
+      </td>
+      {{end}}
     </tr>
   {{end}}
   </tbody>

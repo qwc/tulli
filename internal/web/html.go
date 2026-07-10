@@ -12,6 +12,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"codeberg.org/qwc/tulli/internal/auth"
+	"codeberg.org/qwc/tulli/internal/core"
 )
 
 // sessionCookieName is the browser session cookie. It carries only a signed
@@ -36,7 +37,7 @@ func parseTemplates() map[string]*template.Template {
 			return s
 		},
 	}
-	pages := []string{"login", "repos", "repo", "account", "users", "forbidden"}
+	pages := []string{"login", "repos", "repo", "account", "users", "triage", "forbidden"}
 	out := make(map[string]*template.Template, len(pages))
 	for _, p := range pages {
 		out[p] = template.Must(template.New(p).Funcs(funcs).ParseFS(templateFS, "templates/base.html", "templates/"+p+".html"))
@@ -305,6 +306,74 @@ func (s *Server) accountAddKey(w http.ResponseWriter, r *http.Request, me auth.I
 	}
 	s.render(w, http.StatusOK, "account", me, "Account",
 		accountView{Message: "Key registered: " + fp})
+}
+
+// --- triage (§6d) ---
+
+type triageView struct {
+	Items []core.TriageItem
+	Error string
+}
+
+func (s *Server) triagePage(w http.ResponseWriter, r *http.Request, me auth.Identity) {
+	items, err := s.store.ListPendingTriage(r.Context())
+	if err != nil {
+		s.render(w, http.StatusInternalServerError, "triage", me, "Triage", triageView{Error: "list failed"})
+		return
+	}
+	s.render(w, http.StatusOK, "triage", me, "Triage", triageView{Items: items})
+}
+
+// triageDecide records a triage decision. QUARANTINE also writes a manual_block
+// on the ref (the human escalates a CVE into a real gate block — §6d); ACCEPT and
+// DISMISS only record the triage status.
+func (s *Server) triageDecide(w http.ResponseWriter, r *http.Request, me auth.Identity) {
+	id, ok := pathIDVal(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	decision := strings.ToUpper(strings.TrimSpace(r.FormValue("decision")))
+	note := strings.TrimSpace(r.FormValue("note"))
+
+	var status string
+	switch decision {
+	case "ACCEPT":
+		status = "ACCEPTED"
+	case "DISMISS":
+		status = "DISMISSED"
+	case "QUARANTINE":
+		status = "QUARANTINED"
+	default:
+		http.Error(w, "unknown decision", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.store.SetTriageStatus(r.Context(), id, status, me.Login, note); err != nil {
+		http.Error(w, "record decision failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Escalate to a real block via the existing verdict-provenance path.
+	if status == "QUARANTINED" {
+		repoID, ref, sourceID, found, err := s.store.TriageByID(r.Context(), id)
+		if err != nil || !found {
+			http.Error(w, "triage lookup failed", http.StatusInternalServerError)
+			return
+		}
+		reason := "quarantined via CVE triage: " + sourceID
+		if err := s.store.InsertManualBlock(r.Context(), repoID, ref, true, reason, me.Login); err != nil {
+			http.Error(w, "block failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Return to wherever the action came from (repo page or the queue).
+	back := r.FormValue("return")
+	if back == "" {
+		back = "/triage"
+	}
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 // --- admin: users ---

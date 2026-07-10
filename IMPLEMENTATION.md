@@ -287,6 +287,36 @@ auto-block** (§6.6) — they go to triage, never the gate.
   a fake deep scanner; real-`trivy` integration test skip-guarded on the binary
   (Trivy pulls a large DB, so it stays opt-in, out of the default suite).
 
+### 6d — Triage + notify (RESOLVED; closes the founding motivation)
+
+Turns 6c's PENDING triage rows into decisions, and notifies whoever pulled
+something that later got flagged.
+
+- **Triage actions** (reviewer+): each PENDING `triage` row → ACCEPTED (risk
+  accepted / VEX) or DISMISSED (false positive), recording reviewer + note; or
+  **QUARANTINED**, which *also* writes a `manual_block` on the ref so a human can
+  escalate a CVE into a real gate block through the existing verdict-provenance
+  path. CVEs still never *auto*-block — a person decides. A `/triage` queue page
+  (all PENDING) plus per-row action buttons on the repo page.
+- **Notify fires from the reconciler.** The reconciler is the single point that
+  applies *every* quarantine to disk — secret-derived and human — so it's the one
+  natural trigger for "this is now blocked, tell who pulled it." Idempotency is
+  the `notifications` table keyed by `verdict_id`: a row is recorded for the
+  latest verdict only if absent, so the periodic sweep never re-notifies.
+  Recipients = distinct `access_events.user_id` for the repo.
+- **Repo-precise, not ref-precise (honest limitation).** `access_events` has a
+  `ref` column but we don't populate it (no upload-pack want-parsing — Strategy B,
+  deferred), so we know *who pulled the repo*, not *which ref*. Notify says "you
+  pulled repo X, which now has quarantined ref(s) …" — the precise *who* (from the
+  audit identity) is the value; ref-level pull attribution is a documented
+  follow-up.
+- **Delivery = a `Notifier` seam** (`internal/notify`): a log sink that also
+  records the `notifications` row. SMTP/webhook sinks drop in behind the seam
+  later; no external deps for the demo.
+- **Tests.** Triage action → status + (quarantine) manual_block; reconciler
+  records a notification once and not again on re-sweep (idempotency); recipient
+  resolution from access_events; the whole arc on real PG.
+
 ---
 
 ## 6. Testing
