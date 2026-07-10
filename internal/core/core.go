@@ -41,6 +41,21 @@ type Access struct {
 	Bytes    int64
 }
 
+// VulnMatch is the read model for a CVE match on a repo (spec §8.5): a package
+// (PURL) affected by an advisory, with its current triage status. Purely
+// informational — CVE matches never gate (§6.6).
+type VulnMatch struct {
+	Ref          string
+	PURL         string
+	Source       string
+	SourceID     string
+	Severity     string
+	Summary      string
+	ToolSeverity string
+	FixedVersion string
+	TriageStatus string
+}
+
 // Mirror is the seam onto lazy mirroring (implemented by internal/git.Mirror).
 type Mirror interface {
 	// EnsurePresent returns the mirror path and whether it was just created

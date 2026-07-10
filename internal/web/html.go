@@ -200,6 +200,7 @@ type repoPageView struct {
 	Reason     string
 	HiddenRefs []string
 	Findings   []findingView
+	Vulns      []vulnView
 	Error      string
 	CanEdit    bool // reviewer+ sees the action forms
 }
@@ -228,6 +229,7 @@ func (s *Server) renderRepo(w http.ResponseWriter, ctx context.Context, me auth.
 		Reason:     detail.Reason,
 		HiddenRefs: detail.HiddenRefs,
 		Findings:   detail.Findings,
+		Vulns:      detail.Vulns,
 		Error:      formErr,
 		CanEdit:    roleRank(me.Role) >= roleRank(auth.RoleReviewer),
 	})

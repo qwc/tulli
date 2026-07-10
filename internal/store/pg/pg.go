@@ -232,6 +232,60 @@ func (s *Store) CurrentDecision(ctx context.Context, repoID int64, ref string) (
 	return d, err
 }
 
+// --- Stage 6c: deep lane (SBOM / CVE) ---
+
+func (s *Store) InsertTreeScan(ctx context.Context, repoID int64, scanner, ref, tip string) (int64, error) {
+	return s.q.InsertTreeScan(ctx, sqlc.InsertTreeScanParams{
+		RepoID: repoID, Scanner: scanner, Ref: ptr(ref), TipSha: ptr(tip),
+	})
+}
+
+func (s *Store) UpsertVulnerability(ctx context.Context, source, sourceID string, aliases []string, kind, severity, cvssVector, summary string) (int64, error) {
+	if aliases == nil {
+		aliases = []string{}
+	}
+	return s.q.UpsertVulnerability(ctx, sqlc.UpsertVulnerabilityParams{
+		Source: source, SourceID: sourceID, Aliases: aliases, Kind: kind,
+		Severity: ptr(severity), CvssVector: ptr(cvssVector), Summary: ptr(summary),
+	})
+}
+
+func (s *Store) UpsertComponent(ctx context.Context, repoID int64, ref, tip, purl string, scanID int64) (int64, error) {
+	return s.q.UpsertComponent(ctx, sqlc.UpsertComponentParams{
+		RepoID: repoID, Ref: ptr(ref), TipSha: tip, Purl: purl, ScanID: &scanID,
+	})
+}
+
+func (s *Store) UpsertVulnMatch(ctx context.Context, componentID, vulnID, scanID int64, scanner, toolSeverity, fixedVersion string) (int64, error) {
+	return s.q.UpsertVulnMatch(ctx, sqlc.UpsertVulnMatchParams{
+		ComponentID: componentID, VulnID: vulnID, ScanID: &scanID, Scanner: scanner,
+		ToolSeverity: ptr(toolSeverity), FixedVersion: ptr(fixedVersion),
+	})
+}
+
+func (s *Store) OpenTriage(ctx context.Context, repoID int64, ref string, matchID int64) error {
+	return s.q.OpenTriageIfAbsent(ctx, sqlc.OpenTriageIfAbsentParams{
+		RepoID: repoID, Ref: ptr(ref), MatchID: &matchID,
+	})
+}
+
+func (s *Store) VulnMatchesForRepo(ctx context.Context, repoID int64) ([]core.VulnMatch, error) {
+	rows, err := s.q.VulnMatchesForRepo(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.VulnMatch, len(rows))
+	for i, r := range rows {
+		out[i] = core.VulnMatch{
+			Ref: str(r.Ref), PURL: r.Purl, Source: r.Source, SourceID: r.SourceID,
+			Severity: str(r.Severity), Summary: str(r.Summary),
+			ToolSeverity: str(r.ToolSeverity), FixedVersion: str(r.FixedVersion),
+			TriageStatus: r.TriageStatus,
+		}
+	}
+	return out, nil
+}
+
 // --- Stage 6a: identity & access (auth.Store) ---
 
 func (s *Store) InsertUser(ctx context.Context, name string, role auth.Role, kind auth.Kind) (int64, error) {

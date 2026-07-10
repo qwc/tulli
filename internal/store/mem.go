@@ -6,6 +6,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -31,6 +32,28 @@ type Mem struct {
 	sshKeys  map[string]int64        // fingerprint -> user_id
 	tokens   map[string]int64        // token_hash -> user_id
 	nextUser int64
+
+	// Deep lane (SBOM / CVE) — spec §8.5.
+	vulns     map[string]int64 // "source|source_id" -> vuln id
+	vulnByID  map[int64]memVuln
+	comps     map[string]int64 // "repo|tip|purl" -> component id
+	compByID  map[int64]memComp
+	matches   map[string]int64 // "comp|vuln" -> match id
+	matchByID map[int64]memMatch
+	triage    map[int64]string // match id -> triage status
+	nextVuln  int64
+	nextComp  int64
+	nextMatch int64
+}
+
+type memVuln struct{ source, sourceID, severity, summary string }
+type memComp struct {
+	repoID    int64
+	ref, purl string
+}
+type memMatch struct {
+	compID, vulnID         int64
+	toolSeverity, fixedVer string
 }
 
 // memVerdict mirrors a row of the verdicts table (spec §9). ref == "" is a
@@ -70,6 +93,13 @@ func NewMem() *Mem {
 		users:     make(map[int64]auth.Identity),
 		sshKeys:   make(map[string]int64),
 		tokens:    make(map[string]int64),
+		vulns:     make(map[string]int64),
+		vulnByID:  make(map[int64]memVuln),
+		comps:     make(map[string]int64),
+		compByID:  make(map[int64]memComp),
+		matches:   make(map[string]int64),
+		matchByID: make(map[int64]memMatch),
+		triage:    make(map[int64]string),
 	}
 }
 
@@ -334,6 +364,90 @@ func (m *Mem) ListUsers(_ context.Context) ([]auth.Identity, error) {
 		out = append(out, id)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
+	return out, nil
+}
+
+// --- Stage 6c: deep lane (SBOM / CVE) ---
+
+func (m *Mem) InsertTreeScan(_ context.Context, _ int64, _, _, _ string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextScan++
+	return m.nextScan, nil
+}
+
+func (m *Mem) UpsertVulnerability(_ context.Context, source, sourceID string, _ []string, _, severity, _, summary string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := source + "|" + sourceID
+	id, ok := m.vulns[key]
+	if !ok {
+		m.nextVuln++
+		id = m.nextVuln
+		m.vulns[key] = id
+	}
+	m.vulnByID[id] = memVuln{source: source, sourceID: sourceID, severity: severity, summary: summary}
+	return id, nil
+}
+
+func (m *Mem) UpsertComponent(_ context.Context, repoID int64, ref, tip, purl string, _ int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%d|%s|%s", repoID, tip, purl)
+	id, ok := m.comps[key]
+	if !ok {
+		m.nextComp++
+		id = m.nextComp
+		m.comps[key] = id
+	}
+	m.compByID[id] = memComp{repoID: repoID, ref: ref, purl: purl}
+	return id, nil
+}
+
+func (m *Mem) UpsertVulnMatch(_ context.Context, componentID, vulnID, _ int64, _, toolSeverity, fixedVersion string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%d|%d", componentID, vulnID)
+	id, ok := m.matches[key]
+	if !ok {
+		m.nextMatch++
+		id = m.nextMatch
+		m.matches[key] = id
+	}
+	m.matchByID[id] = memMatch{compID: componentID, vulnID: vulnID, toolSeverity: toolSeverity, fixedVer: fixedVersion}
+	return id, nil
+}
+
+func (m *Mem) OpenTriage(_ context.Context, _ int64, _ string, matchID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.triage[matchID]; !ok {
+		m.triage[matchID] = "PENDING"
+	}
+	return nil
+}
+
+func (m *Mem) VulnMatchesForRepo(_ context.Context, repoID int64) ([]core.VulnMatch, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []core.VulnMatch
+	for mid, mm := range m.matchByID {
+		comp, ok := m.compByID[mm.compID]
+		if !ok || comp.repoID != repoID {
+			continue
+		}
+		v := m.vulnByID[mm.vulnID]
+		status := m.triage[mid]
+		if status == "" {
+			status = "PENDING"
+		}
+		out = append(out, core.VulnMatch{
+			Ref: comp.ref, PURL: comp.purl, Source: v.source, SourceID: v.sourceID,
+			Severity: v.severity, Summary: v.summary,
+			ToolSeverity: mm.toolSeverity, FixedVersion: mm.fixedVer, TriageStatus: status,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SourceID < out[j].SourceID })
 	return out, nil
 }
 

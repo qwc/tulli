@@ -250,6 +250,43 @@ carve-out into its own executable stays a `main()`+Dockerfile change.
   triage views (6d), per-repo RBAC (6g), an audit-events page (needs a
   `RecentAccessEvents` query, not yet written).
 
+### 6c — Trivy / SBOM / CVE (Deep lane, RESOLVED)
+
+The vuln tables already exist (`vulnerabilities`/`components`/`vuln_matches`/
+`triage`, migration 00001), so 6c is code, not schema. Key rule: **CVEs never
+auto-block** (§6.6) — they go to triage, never the gate.
+
+- **Separate Deep-lane pipeline.** The existing `scan.Worker` feeds the gate
+  (finding → RecomputeRepo → hideRefs) and is the *wrong* shape for CVEs. 6c adds
+  an independent **`DeepWorker`** (own queue/goroutine, the Lane split the seam
+  already anticipates) whose pipeline is: materialize tree → Trivy → write
+  `components`/`vulnerabilities`/`vuln_matches` → open `triage` (PENDING). **No
+  verdict recompute, no reconcile** — the gate is untouched, so the fast/secret
+  path is unaffected.
+- **Two result shapes, one machinery.** A `DeepScanner` interface returning a
+  `DeepResult{Components, Matches}` sits beside the fast-lane `Scanner`
+  (`ScanResult{Findings}`); `Descriptor`/`ScanScope`/`Lane`/`Attribution` are
+  shared. Honest about the two lanes producing genuinely different outputs
+  (gating findings vs triageable matches).
+- **Tree materialization.** `git.ExportTree` = `git archive <tip> | tar -x` into a
+  temp dir (works on the bare mirror, no checkout state), scanned then deleted.
+  Deep scan targets the default branch tip (HEAD) for the prototype.
+- **Normalize on OSV/PURL/CVSS.** Trivy JSON → `vulnerabilities` (source/source_id
+  + aliases, cvss_vector, kind=CVE), `components` (PURL per tip), `vuln_matches`
+  (the join Trivy already computed; the standalone re-join-without-rescan is the
+  deferred optimization — the timer just re-runs Trivy). Severity map:
+  CRITICAL+HIGH→HIGH, MEDIUM→MEDIUM, LOW+UNKNOWN→LOW.
+- **Trigger.** Enqueued on first-fetch (`created`) alongside the secret scan via a
+  fan-out enqueuer (fast + deep). On-timer re-match deferred.
+- **Made visible (presentable).** A **read-only vulnerabilities section on the
+  repo detail page** (purl→CVE→severity→fix, marked "does not block — triage in
+  6d"). Triage *actions* (accept/dismiss/quarantine) are 6d.
+- **Demo packaging.** Trivy binary + a **pre-warmed vuln DB baked into the Docker
+  image** so the live demo is fast/offline (decided over runtime download).
+- **Tests.** Parser unit test from a Trivy JSON fixture; DeepWorker pipeline with
+  a fake deep scanner; real-`trivy` integration test skip-guarded on the binary
+  (Trivy pulls a large DB, so it stays opt-in, out of the default suite).
+
 ---
 
 ## 6. Testing

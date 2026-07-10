@@ -43,6 +43,54 @@ INSERT INTO scans (repo_id, scanner, scope_kind, scope_expr, status, finished_at
 VALUES ($1, $2, $3, sqlc.narg('scope_expr'), 'COMPLETE', NOW())
 RETURNING id;
 
+-- name: InsertTreeScan :one
+-- A deep-lane (TREE) scan of a ref tip: records ref + tip_sha (spec §8.5).
+INSERT INTO scans (repo_id, scanner, scope_kind, ref, tip_sha, status, finished_at)
+VALUES ($1, $2, 'TREE', sqlc.narg('ref'), $3, 'COMPLETE', NOW())
+RETURNING id;
+
+-- name: UpsertVulnerability :one
+-- Advisory, keyed on OSV identity (source, source_id); idempotent (spec §8.6).
+INSERT INTO vulnerabilities (source, source_id, aliases, kind, cvss_vector, severity, summary)
+VALUES ($1, $2, $3, $4, sqlc.narg('cvss_vector'), sqlc.narg('severity'), sqlc.narg('summary'))
+ON CONFLICT (source, source_id) DO UPDATE
+  SET cvss_vector = EXCLUDED.cvss_vector, severity = EXCLUDED.severity, summary = EXCLUDED.summary
+RETURNING id;
+
+-- name: UpsertComponent :one
+-- SBOM entry for a tip, keyed (repo, tip, purl); immutable per tip (spec §8.5).
+INSERT INTO components (repo_id, ref, tip_sha, purl, scan_id)
+VALUES ($1, sqlc.narg('ref'), $2, $3, $4)
+ON CONFLICT (repo_id, tip_sha, purl) DO UPDATE SET scan_id = EXCLUDED.scan_id
+RETURNING id;
+
+-- name: UpsertVulnMatch :one
+-- The component⋈vuln join, keyed (component, vuln); refreshes last_seen.
+INSERT INTO vuln_matches (component_id, vuln_id, scan_id, scanner, tool_severity, fixed_version)
+VALUES ($1, $2, $3, $4, sqlc.narg('tool_severity'), sqlc.narg('fixed_version'))
+ON CONFLICT (component_id, vuln_id) DO UPDATE
+  SET last_seen = NOW(), scan_id = EXCLUDED.scan_id, fixed_version = EXCLUDED.fixed_version
+RETURNING id;
+
+-- name: OpenTriageIfAbsent :exec
+-- Open a PENDING triage item for a match, once. The NOT EXISTS keeps re-scans
+-- from piling up duplicate rows for the same match.
+INSERT INTO triage (repo_id, ref, match_id, status)
+SELECT $1, sqlc.narg('ref'), $2, 'PENDING'
+WHERE NOT EXISTS (SELECT 1 FROM triage WHERE match_id = $2);
+
+-- name: VulnMatchesForRepo :many
+-- Read model for the repo detail page: every CVE match with its package, advisory
+-- and current triage status (spec §8.5). Newest first.
+SELECT c.ref, c.purl, v.source, v.source_id, v.severity, v.summary,
+       m.tool_severity, m.fixed_version, COALESCE(tr.status, 'PENDING') AS triage_status
+FROM vuln_matches m
+JOIN components c ON c.id = m.component_id
+JOIN vulnerabilities v ON v.id = m.vuln_id
+LEFT JOIN triage tr ON tr.match_id = m.id
+WHERE c.repo_id = $1
+ORDER BY m.last_seen DESC;
+
 -- name: InsertFinding :exec
 INSERT INTO findings
     (scan_id, repo_id, ref, scanner, severity, rule_id, file_path, line_number, commit_sha, fingerprint, description)

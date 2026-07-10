@@ -51,6 +51,27 @@
 <p class="muted">No findings recorded.</p>
 {{end}}
 
+<h2>Vulnerabilities <span class="muted" style="font-weight:400">(informational — these do not block; triage arrives in a later stage)</span></h2>
+{{if .Data.Vulns}}
+<table>
+  <thead><tr><th>Ref</th><th>Package</th><th>Advisory</th><th>Severity</th><th>Fixed in</th><th>Triage</th></tr></thead>
+  <tbody>
+  {{range .Data.Vulns}}
+    <tr>
+      <td class="mono">{{if .Ref}}{{.Ref}}{{else}}(default){{end}}</td>
+      <td class="mono">{{.PURL}}</td>
+      <td class="mono" title="{{.Summary}}">{{.SourceID}}</td>
+      <td>{{if eq .Severity "HIGH"}}<span class="badge bad">{{.Severity}}</span>{{else}}{{.Severity}}{{end}}</td>
+      <td class="mono">{{if .FixedVersion}}{{.FixedVersion}}{{else}}—{{end}}</td>
+      <td><span class="badge role">{{.TriageStatus}}</span></td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">No vulnerabilities recorded (no deep scan yet, or none found).</p>
+{{end}}
+
 {{if $edit}}
 <div class="grid2">
   <fieldset>

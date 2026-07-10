@@ -333,6 +333,32 @@ func (q *Queries) InsertToken(ctx context.Context, arg InsertTokenParams) error 
 	return err
 }
 
+const insertTreeScan = `-- name: InsertTreeScan :one
+INSERT INTO scans (repo_id, scanner, scope_kind, ref, tip_sha, status, finished_at)
+VALUES ($1, $2, 'TREE', $4, $3, 'COMPLETE', NOW())
+RETURNING id
+`
+
+type InsertTreeScanParams struct {
+	RepoID  int64
+	Scanner string
+	TipSha  *string
+	Ref     *string
+}
+
+// A deep-lane (TREE) scan of a ref tip: records ref + tip_sha (spec §8.5).
+func (q *Queries) InsertTreeScan(ctx context.Context, arg InsertTreeScanParams) (int64, error) {
+	row := q.db.QueryRow(ctx, insertTreeScan,
+		arg.RepoID,
+		arg.Scanner,
+		arg.TipSha,
+		arg.Ref,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const insertUser = `-- name: InsertUser :one
 
 INSERT INTO users (name, role, kind) VALUES ($1, $2, $3) RETURNING id
@@ -465,6 +491,25 @@ func (q *Queries) ManualBlockRefs(ctx context.Context, repoID int64) ([]*string,
 	return items, nil
 }
 
+const openTriageIfAbsent = `-- name: OpenTriageIfAbsent :exec
+INSERT INTO triage (repo_id, ref, match_id, status)
+SELECT $1, $3, $2, 'PENDING'
+WHERE NOT EXISTS (SELECT 1 FROM triage WHERE match_id = $2)
+`
+
+type OpenTriageIfAbsentParams struct {
+	RepoID  int64
+	MatchID *int64
+	Ref     *string
+}
+
+// Open a PENDING triage item for a match, once. The NOT EXISTS keeps re-scans
+// from piling up duplicate rows for the same match.
+func (q *Queries) OpenTriageIfAbsent(ctx context.Context, arg OpenTriageIfAbsentParams) error {
+	_, err := q.db.Exec(ctx, openTriageIfAbsent, arg.RepoID, arg.MatchID, arg.Ref)
+	return err
+}
+
 const overriddenFingerprints = `-- name: OverriddenFingerprints :many
 SELECT fingerprint FROM overrides WHERE repo_id = $1 AND (ref IS NULL OR ref = $2)
 `
@@ -495,6 +540,35 @@ func (q *Queries) OverriddenFingerprints(ctx context.Context, arg OverriddenFing
 	return items, nil
 }
 
+const upsertComponent = `-- name: UpsertComponent :one
+INSERT INTO components (repo_id, ref, tip_sha, purl, scan_id)
+VALUES ($1, $5, $2, $3, $4)
+ON CONFLICT (repo_id, tip_sha, purl) DO UPDATE SET scan_id = EXCLUDED.scan_id
+RETURNING id
+`
+
+type UpsertComponentParams struct {
+	RepoID int64
+	TipSha string
+	Purl   string
+	ScanID *int64
+	Ref    *string
+}
+
+// SBOM entry for a tip, keyed (repo, tip, purl); immutable per tip (spec §8.5).
+func (q *Queries) UpsertComponent(ctx context.Context, arg UpsertComponentParams) (int64, error) {
+	row := q.db.QueryRow(ctx, upsertComponent,
+		arg.RepoID,
+		arg.TipSha,
+		arg.Purl,
+		arg.ScanID,
+		arg.Ref,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const upsertRepo = `-- name: UpsertRepo :one
 INSERT INTO repos (upstream_url, mirror_path)
 VALUES ($1, $2)
@@ -509,6 +583,72 @@ type UpsertRepoParams struct {
 
 func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (int64, error) {
 	row := q.db.QueryRow(ctx, upsertRepo, arg.UpstreamUrl, arg.MirrorPath)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const upsertVulnMatch = `-- name: UpsertVulnMatch :one
+INSERT INTO vuln_matches (component_id, vuln_id, scan_id, scanner, tool_severity, fixed_version)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (component_id, vuln_id) DO UPDATE
+  SET last_seen = NOW(), scan_id = EXCLUDED.scan_id, fixed_version = EXCLUDED.fixed_version
+RETURNING id
+`
+
+type UpsertVulnMatchParams struct {
+	ComponentID  int64
+	VulnID       int64
+	ScanID       *int64
+	Scanner      string
+	ToolSeverity *string
+	FixedVersion *string
+}
+
+// The component⋈vuln join, keyed (component, vuln); refreshes last_seen.
+func (q *Queries) UpsertVulnMatch(ctx context.Context, arg UpsertVulnMatchParams) (int64, error) {
+	row := q.db.QueryRow(ctx, upsertVulnMatch,
+		arg.ComponentID,
+		arg.VulnID,
+		arg.ScanID,
+		arg.Scanner,
+		arg.ToolSeverity,
+		arg.FixedVersion,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const upsertVulnerability = `-- name: UpsertVulnerability :one
+INSERT INTO vulnerabilities (source, source_id, aliases, kind, cvss_vector, severity, summary)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (source, source_id) DO UPDATE
+  SET cvss_vector = EXCLUDED.cvss_vector, severity = EXCLUDED.severity, summary = EXCLUDED.summary
+RETURNING id
+`
+
+type UpsertVulnerabilityParams struct {
+	Source     string
+	SourceID   string
+	Aliases    []string
+	Kind       string
+	CvssVector *string
+	Severity   *string
+	Summary    *string
+}
+
+// Advisory, keyed on OSV identity (source, source_id); idempotent (spec §8.6).
+func (q *Queries) UpsertVulnerability(ctx context.Context, arg UpsertVulnerabilityParams) (int64, error) {
+	row := q.db.QueryRow(ctx, upsertVulnerability,
+		arg.Source,
+		arg.SourceID,
+		arg.Aliases,
+		arg.Kind,
+		arg.CvssVector,
+		arg.Severity,
+		arg.Summary,
+	)
 	var id int64
 	err := row.Scan(&id)
 	return id, err
@@ -585,4 +725,59 @@ func (q *Queries) UserByTokenHash(ctx context.Context, tokenHash string) (UserBy
 		&i.Kind,
 	)
 	return i, err
+}
+
+const vulnMatchesForRepo = `-- name: VulnMatchesForRepo :many
+SELECT c.ref, c.purl, v.source, v.source_id, v.severity, v.summary,
+       m.tool_severity, m.fixed_version, COALESCE(tr.status, 'PENDING') AS triage_status
+FROM vuln_matches m
+JOIN components c ON c.id = m.component_id
+JOIN vulnerabilities v ON v.id = m.vuln_id
+LEFT JOIN triage tr ON tr.match_id = m.id
+WHERE c.repo_id = $1
+ORDER BY m.last_seen DESC
+`
+
+type VulnMatchesForRepoRow struct {
+	Ref          *string
+	Purl         string
+	Source       string
+	SourceID     string
+	Severity     *string
+	Summary      *string
+	ToolSeverity *string
+	FixedVersion *string
+	TriageStatus string
+}
+
+// Read model for the repo detail page: every CVE match with its package, advisory
+// and current triage status (spec §8.5). Newest first.
+func (q *Queries) VulnMatchesForRepo(ctx context.Context, repoID int64) ([]VulnMatchesForRepoRow, error) {
+	rows, err := q.db.Query(ctx, vulnMatchesForRepo, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []VulnMatchesForRepoRow
+	for rows.Next() {
+		var i VulnMatchesForRepoRow
+		if err := rows.Scan(
+			&i.Ref,
+			&i.Purl,
+			&i.Source,
+			&i.SourceID,
+			&i.Severity,
+			&i.Summary,
+			&i.ToolSeverity,
+			&i.FixedVersion,
+			&i.TriageStatus,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

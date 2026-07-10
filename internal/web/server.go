@@ -54,6 +54,8 @@ type Store interface {
 	UserByID(ctx context.Context, userID int64) (auth.Identity, bool, error)
 	// ListUsers backs the admin users view.
 	ListUsers(ctx context.Context) ([]auth.Identity, error)
+	// VulnMatchesForRepo backs the (read-only) CVE section of the repo page.
+	VulnMatchesForRepo(ctx context.Context, repoID int64) ([]core.VulnMatch, error)
 }
 
 type Server struct {
@@ -256,9 +258,23 @@ type findingView struct {
 	Fingerprint string `json:"fingerprint"`
 }
 
+// vulnView is one CVE match on the repo page — informational, never gating.
+type vulnView struct {
+	Ref          string `json:"ref"`
+	PURL         string `json:"purl"`
+	Source       string `json:"source"`
+	SourceID     string `json:"source_id"`
+	Severity     string `json:"severity"`
+	Summary      string `json:"summary,omitempty"`
+	ToolSeverity string `json:"tool_severity,omitempty"`
+	FixedVersion string `json:"fixed_version,omitempty"`
+	TriageStatus string `json:"triage_status"`
+}
+
 type repoDetail struct {
 	repoView
 	Findings []findingView `json:"findings"`
+	Vulns    []vulnView    `json:"vulnerabilities"`
 }
 
 func (s *Server) getRepo(w http.ResponseWriter, r *http.Request, _ auth.Identity) {
@@ -298,9 +314,22 @@ func (s *Server) buildRepoDetail(ctx context.Context, id int64) (repoDetail, err
 			})
 		}
 	}
+	vms, err := s.store.VulnMatchesForRepo(ctx, id)
+	if err != nil {
+		return repoDetail{}, err
+	}
+	vulns := make([]vulnView, 0, len(vms))
+	for _, m := range vms {
+		vulns = append(vulns, vulnView{
+			Ref: m.Ref, PURL: m.PURL, Source: m.Source, SourceID: m.SourceID,
+			Severity: m.Severity, Summary: m.Summary, ToolSeverity: m.ToolSeverity,
+			FixedVersion: m.FixedVersion, TriageStatus: m.TriageStatus,
+		})
+	}
 	return repoDetail{
 		repoView: repoView{ID: id, Blocked: v.RepoBlocked, Reason: v.Reason, HiddenRefs: v.HiddenRefs},
 		Findings: findings,
+		Vulns:    vulns,
 	}, nil
 }
 

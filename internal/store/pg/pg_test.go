@@ -262,6 +262,61 @@ func TestPG_AuthLookups(t *testing.T) {
 	}
 }
 
+// TestPG_DeepLaneVulnMatches exercises the 6c deep-lane writes on real Postgres:
+// upsert an advisory + component + match, open triage, and read the join model.
+// Re-running must be idempotent (no duplicate rows) — the on-conflict upserts.
+func TestPG_DeepLaneVulnMatches(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	repoID, err := s.UpsertRepo(ctx, "https://github.com/o/app", "/m/app.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	write := func() {
+		scanID, err := s.InsertTreeScan(ctx, repoID, "trivy", "refs/heads/main", "abc123")
+		if err != nil {
+			t.Fatal(err)
+		}
+		vulnID, err := s.UpsertVulnerability(ctx, "nvd", "CVE-2023-1111", nil, "CVE", "HIGH", "CVSS:3.1/AV:N", "SSRF")
+		if err != nil {
+			t.Fatal(err)
+		}
+		compID, err := s.UpsertComponent(ctx, repoID, "refs/heads/main", "abc123", "pkg:pypi/requests@2.19.0", scanID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		matchID, err := s.UpsertVulnMatch(ctx, compID, vulnID, scanID, "trivy", "CRITICAL", "2.20.0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.OpenTriage(ctx, repoID, "refs/heads/main", matchID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	write() // second pass must not duplicate
+
+	matches, err := s.VulnMatchesForRepo(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("got %d matches, want 1 (idempotent upserts)", len(matches))
+	}
+	m := matches[0]
+	if m.SourceID != "CVE-2023-1111" || m.PURL != "pkg:pypi/requests@2.19.0" ||
+		m.Severity != "HIGH" || m.FixedVersion != "2.20.0" || m.TriageStatus != "PENDING" {
+		t.Fatalf("match = %+v", m)
+	}
+}
+
 // TestPG_ManualBlockSurvivesRecompute exercises verdict-provenance (Option B) on
 // real Postgres: a human block with NO backing finding must survive repeated
 // recompute sweeps (the latent clobber), enforce as a repo-wide block, and lift

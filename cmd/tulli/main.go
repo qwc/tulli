@@ -36,6 +36,7 @@ import (
 type backend interface {
 	core.Store
 	scan.Store
+	scan.DeepStore
 	mirror.Store
 	auth.Store
 	web.Store
@@ -129,7 +130,14 @@ func main() {
 	go worker.Run(ctx)
 	go reconciler.Run(ctx, *reconcile)
 
-	gate := core.New(m, st, worker, log)
+	// Deep lane (stage 6c): Trivy SBOM/CVE over a materialised tree. Independent
+	// of the fast/secret worker so a slow external tool can't starve it; its
+	// output goes to the vuln tables + triage queue and NEVER gates (§6.6).
+	deepWorker := scan.NewDeepWorker(scan.NewTrivy(), st, git.ExportTree, git.DefaultBranch, git.MkTempExport, log)
+	go deepWorker.Run(ctx)
+
+	// First fetch triggers both lanes.
+	gate := core.New(m, st, scan.FanOut{worker, deepWorker}, log)
 
 	// Identity provider (stage 6a): the local database is the first provider;
 	// LDAP/OIDC slot in behind auth.Authenticator later.
