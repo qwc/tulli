@@ -24,10 +24,12 @@ type Admission struct {
 	BlockMsg string // remote: message when !Allowed (spec §3.3)
 }
 
-// RepoInfo identifies a mirrored repo for the reconcile sweep (id + on-disk path).
+// RepoInfo identifies a mirrored repo for the reconcile sweep (id + on-disk path)
+// and the web list (upstream URL is the human-facing identity, not the surrogate id).
 type RepoInfo struct {
-	ID         int64
-	MirrorPath string
+	ID          int64
+	UpstreamURL string
+	MirrorPath  string
 }
 
 // Access is one recorded fetch (spec §9 access_events). Ref/commit are left for

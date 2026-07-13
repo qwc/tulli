@@ -205,12 +205,33 @@ func (m *Mem) CurrentDecision(_ context.Context, repoID int64, ref string) (stri
 func (m *Mem) ListRepos(_ context.Context) ([]core.RepoInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	upstream := make(map[int64]string, len(m.repos))
+	for url, id := range m.repos {
+		upstream[id] = url
+	}
 	out := make([]core.RepoInfo, 0, len(m.paths))
 	for id, path := range m.paths {
-		out = append(out, core.RepoInfo{ID: id, MirrorPath: path})
+		out = append(out, core.RepoInfo{ID: id, UpstreamURL: upstream[id], MirrorPath: path})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+func (m *Mem) RepoByID(_ context.Context, id int64) (core.RepoInfo, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path, ok := m.paths[id]
+	if !ok {
+		return core.RepoInfo{}, false, nil
+	}
+	var upstream string
+	for url, rid := range m.repos {
+		if rid == id {
+			upstream = url
+			break
+		}
+	}
+	return core.RepoInfo{ID: id, UpstreamURL: upstream, MirrorPath: path}, true, nil
 }
 
 func (m *Mem) InsertScan(_ context.Context, _ int64, _, _, _ string) (int64, error) {

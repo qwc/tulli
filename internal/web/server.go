@@ -42,6 +42,7 @@ const sessionTTL = 12 * time.Hour
 // internal/store/pg — the web composes existing seams, adding none.
 type Store interface {
 	ListRepos(ctx context.Context) ([]core.RepoInfo, error)
+	RepoByID(ctx context.Context, id int64) (core.RepoInfo, bool, error)
 	ResolveVerdict(ctx context.Context, repoID int64) (core.Verdict, error)
 	AffectedRefs(ctx context.Context, repoID int64) ([]string, error)
 	FindingsForRef(ctx context.Context, repoID int64, ref string) ([]verdict.Finding, error)
@@ -226,11 +227,12 @@ func bearer(r *http.Request) (string, bool) {
 // --- read handlers ---
 
 type repoView struct {
-	ID         int64    `json:"id"`
-	MirrorPath string   `json:"mirror_path"`
-	Blocked    bool     `json:"blocked"`
-	Reason     string   `json:"reason,omitempty"`
-	HiddenRefs []string `json:"hidden_refs,omitempty"`
+	ID          int64    `json:"id"`
+	UpstreamURL string   `json:"upstream_url"`
+	MirrorPath  string   `json:"mirror_path"`
+	Blocked     bool     `json:"blocked"`
+	Reason      string   `json:"reason,omitempty"`
+	HiddenRefs  []string `json:"hidden_refs,omitempty"`
 }
 
 func (s *Server) listRepos(w http.ResponseWriter, r *http.Request, _ auth.Identity) {
@@ -247,7 +249,7 @@ func (s *Server) listRepos(w http.ResponseWriter, r *http.Request, _ auth.Identi
 			return
 		}
 		out = append(out, repoView{
-			ID: rp.ID, MirrorPath: rp.MirrorPath,
+			ID: rp.ID, UpstreamURL: rp.UpstreamURL, MirrorPath: rp.MirrorPath,
 			Blocked: v.RepoBlocked, Reason: v.Reason, HiddenRefs: v.HiddenRefs,
 		})
 	}
@@ -300,6 +302,10 @@ func (s *Server) getRepo(w http.ResponseWriter, r *http.Request, _ auth.Identity
 // buildRepoDetail assembles a repo's verdict + findings — shared by the JSON API
 // and the HTML detail page so both show the same data.
 func (s *Server) buildRepoDetail(ctx context.Context, id int64) (repoDetail, error) {
+	rp, _, err := s.store.RepoByID(ctx, id)
+	if err != nil {
+		return repoDetail{}, err
+	}
 	v, err := s.store.ResolveVerdict(ctx, id)
 	if err != nil {
 		return repoDetail{}, err
@@ -334,7 +340,7 @@ func (s *Server) buildRepoDetail(ctx context.Context, id int64) (repoDetail, err
 		})
 	}
 	return repoDetail{
-		repoView: repoView{ID: id, Blocked: v.RepoBlocked, Reason: v.Reason, HiddenRefs: v.HiddenRefs},
+		repoView: repoView{ID: id, UpstreamURL: rp.UpstreamURL, MirrorPath: rp.MirrorPath, Blocked: v.RepoBlocked, Reason: v.Reason, HiddenRefs: v.HiddenRefs},
 		Findings: findings,
 		Vulns:    vulns,
 	}, nil

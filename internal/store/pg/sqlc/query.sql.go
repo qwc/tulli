@@ -452,12 +452,13 @@ func (q *Queries) ListPendingTriage(ctx context.Context) ([]ListPendingTriageRow
 }
 
 const listRepos = `-- name: ListRepos :many
-SELECT id, mirror_path FROM repos
+SELECT id, upstream_url, mirror_path FROM repos ORDER BY id
 `
 
 type ListReposRow struct {
-	ID         int64
-	MirrorPath string
+	ID          int64
+	UpstreamUrl string
+	MirrorPath  string
 }
 
 func (q *Queries) ListRepos(ctx context.Context) ([]ListReposRow, error) {
@@ -469,7 +470,7 @@ func (q *Queries) ListRepos(ctx context.Context) ([]ListReposRow, error) {
 	var items []ListReposRow
 	for rows.Next() {
 		var i ListReposRow
-		if err := rows.Scan(&i.ID, &i.MirrorPath); err != nil {
+		if err := rows.Scan(&i.ID, &i.UpstreamUrl, &i.MirrorPath); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -657,6 +658,23 @@ func (q *Queries) RecordNotificationForLatestVerdict(ctx context.Context, arg Re
 	var id int64
 	err := row.Scan(&id)
 	return id, err
+}
+
+const repoByID = `-- name: RepoByID :one
+SELECT id, upstream_url, mirror_path FROM repos WHERE id = $1
+`
+
+type RepoByIDRow struct {
+	ID          int64
+	UpstreamUrl string
+	MirrorPath  string
+}
+
+func (q *Queries) RepoByID(ctx context.Context, id int64) (RepoByIDRow, error) {
+	row := q.db.QueryRow(ctx, repoByID, id)
+	var i RepoByIDRow
+	err := row.Scan(&i.ID, &i.UpstreamUrl, &i.MirrorPath)
+	return i, err
 }
 
 const setTriageStatus = `-- name: SetTriageStatus :exec

@@ -114,9 +114,20 @@ func (s *Store) ListRepos(ctx context.Context) ([]core.RepoInfo, error) {
 	}
 	out := make([]core.RepoInfo, len(rows))
 	for i, r := range rows {
-		out[i] = core.RepoInfo{ID: r.ID, MirrorPath: r.MirrorPath}
+		out[i] = core.RepoInfo{ID: r.ID, UpstreamURL: r.UpstreamUrl, MirrorPath: r.MirrorPath}
 	}
 	return out, nil
+}
+
+func (s *Store) RepoByID(ctx context.Context, id int64) (core.RepoInfo, bool, error) {
+	r, err := s.q.RepoByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return core.RepoInfo{}, false, nil
+		}
+		return core.RepoInfo{}, false, err
+	}
+	return core.RepoInfo{ID: r.ID, UpstreamURL: r.UpstreamUrl, MirrorPath: r.MirrorPath}, true, nil
 }
 
 func (s *Store) InsertScan(ctx context.Context, repoID int64, scanner, scopeKind, scopeExpr string) (int64, error) {

@@ -9,7 +9,10 @@ INSERT INTO access_events (repo_id, user_id, source_ip, http_status, bytes)
 VALUES ($1, sqlc.narg('user_id'), sqlc.narg('source_ip')::inet, $2, $3);
 
 -- name: ListRepos :many
-SELECT id, mirror_path FROM repos;
+SELECT id, upstream_url, mirror_path FROM repos ORDER BY id;
+
+-- name: RepoByID :one
+SELECT id, upstream_url, mirror_path FROM repos WHERE id = $1;
 
 -- Stage 6a: identity & access (auth.Store).
 

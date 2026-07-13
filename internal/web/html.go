@@ -185,7 +185,7 @@ func (s *Server) reposPage(w http.ResponseWriter, r *http.Request, me auth.Ident
 			continue
 		}
 		out = append(out, repoView{
-			ID: rp.ID, MirrorPath: rp.MirrorPath,
+			ID: rp.ID, UpstreamURL: rp.UpstreamURL, MirrorPath: rp.MirrorPath,
 			Blocked: v.RepoBlocked, Reason: v.Reason, HiddenRefs: v.HiddenRefs,
 		})
 	}
@@ -196,14 +196,15 @@ func (s *Server) reposPage(w http.ResponseWriter, r *http.Request, me auth.Ident
 // embedding) for straightforward template field access, plus an optional form
 // error to re-render after a rejected block/override.
 type repoPageView struct {
-	ID         int64
-	Blocked    bool
-	Reason     string
-	HiddenRefs []string
-	Findings   []findingView
-	Vulns      []vulnView
-	Error      string
-	CanEdit    bool // reviewer+ sees the action forms
+	ID          int64
+	UpstreamURL string
+	Blocked     bool
+	Reason      string
+	HiddenRefs  []string
+	Findings    []findingView
+	Vulns       []vulnView
+	Error       string
+	CanEdit     bool // reviewer+ sees the action forms
 }
 
 func (s *Server) repoPage(w http.ResponseWriter, r *http.Request, me auth.Identity) {
@@ -225,14 +226,15 @@ func (s *Server) renderRepo(w http.ResponseWriter, ctx context.Context, me auth.
 		return
 	}
 	s.render(w, status, "repo", me, "Repo", repoPageView{
-		ID:         detail.ID,
-		Blocked:    detail.Blocked,
-		Reason:     detail.Reason,
-		HiddenRefs: detail.HiddenRefs,
-		Findings:   detail.Findings,
-		Vulns:      detail.Vulns,
-		Error:      formErr,
-		CanEdit:    roleRank(me.Role) >= roleRank(auth.RoleReviewer),
+		ID:          detail.ID,
+		UpstreamURL: detail.UpstreamURL,
+		Blocked:     detail.Blocked,
+		Reason:      detail.Reason,
+		HiddenRefs:  detail.HiddenRefs,
+		Findings:    detail.Findings,
+		Vulns:       detail.Vulns,
+		Error:       formErr,
+		CanEdit:     roleRank(me.Role) >= roleRank(auth.RoleReviewer),
 	})
 }
 
