@@ -129,9 +129,16 @@ func (m *Mirror) clone(ctx context.Context, ref RepoRef, dir string) error {
 	return nil
 }
 
-// gitCloneMirror is the production clone: `git clone --mirror` into dst.
+// gitCloneMirror is the production clone: `git clone --bare` into dst.
+//
+// It is --bare, NOT --mirror, on purpose. --mirror fetches +refs/*:refs/* — every
+// namespace, including server-side refs the host exposes (GitHub's refs/pull/*,
+// GitLab's refs/merge-requests/*). Those would be served to clients but tulli only
+// scans refs/heads/ + refs/tags/ (RefsContaining), so they could never be
+// quarantined — a hole. --bare mirrors exactly refs/heads/* + tags (and sets
+// HEAD), so the served ref set equals the scanned/quarantinable set.
 func gitCloneMirror(ctx context.Context, upstream, dst string) error {
-	cmd := exec.CommandContext(ctx, "git", "clone", "--mirror", "--quiet", upstream, dst)
+	cmd := exec.CommandContext(ctx, "git", "clone", "--bare", "--quiet", upstream, dst)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0") // never prompt (public/anon)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

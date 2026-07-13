@@ -60,6 +60,12 @@ func (r *Reconciler) ReconcileRepo(ctx context.Context, repoID int64, repoPath s
 	if err := git.SetHiddenRefs(ctx, repoPath, v.HiddenRefs); err != nil { // empty slice clears
 		return err
 	}
+	// hideRefs does not cover the HEAD pseudo-ref: if HEAD still points at a
+	// quarantined branch, a clone follows HEAD and clones the hidden content into
+	// a detached HEAD, bypassing the ref-hide. Move HEAD off any hidden branch.
+	if err := git.EnsureServableHead(ctx, repoPath, v.HiddenRefs); err != nil {
+		return err
+	}
 	r.notifyQuarantine(ctx, repoID, repoPath, v)
 	return nil
 }

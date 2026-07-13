@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -76,6 +77,85 @@ func TestReconcileRepo_AppliesAndClearsHideRefs(t *testing.T) {
 	}
 	if got := hiddenRefs(t, repo); got != nil {
 		t.Fatalf("hidden = %v, want none after un-quarantine", got)
+	}
+}
+
+// makeBareRepoWithBranches builds a bare mirror with a commit on each branch and
+// HEAD on the first, so reconcile's HEAD handling can be exercised.
+func makeBareRepoWithBranches(t *testing.T, branches ...string) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir, cmd.Env = work, env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run("init", "-q", "-b", branches[0], ".")
+	for i, b := range branches {
+		if i > 0 {
+			run("checkout", "-q", "-b", b)
+		}
+		if err := os.WriteFile(filepath.Join(work, b+".txt"), []byte(b), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run("add", "-A")
+		run("commit", "-q", "-m", b)
+	}
+	run("checkout", "-q", branches[0])
+	bare := filepath.Join(base, "r.git")
+	if out, err := exec.Command("git", "clone", "-q", "--bare", work, bare).CombinedOutput(); err != nil {
+		t.Fatalf("git clone --bare: %v\n%s", err, out)
+	}
+	return bare
+}
+
+func headOf(t *testing.T, repo string) string {
+	t.Helper()
+	out, _ := exec.Command("git", "--git-dir", repo, "symbolic-ref", "-q", "HEAD").Output()
+	return strings.TrimSpace(string(out))
+}
+
+// Regression: quarantining a branch must also move HEAD off it. hideRefs does not
+// cover the HEAD pseudo-ref, so a hidden default branch would otherwise still be
+// served (a client clones it into a detached HEAD, bypassing the ref-hide).
+func TestReconcileRepo_HeadLeavesQuarantine(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMem()
+	r := NewReconciler(st, discardLogger())
+
+	// main tainted, feature clean → HEAD must move to feature.
+	repo := makeBareRepoWithBranches(t, "main", "feature")
+	id, _ := st.UpsertRepo(ctx, "https://h/o/r", repo)
+	st.SetVerdict(id, "refs/heads/main", verdict.DecisionQuarantined, "secret")
+	if err := r.ReconcileRepo(ctx, id, repo); err != nil {
+		t.Fatal(err)
+	}
+	if got := headOf(t, repo); got != "refs/heads/feature" {
+		t.Fatalf("HEAD = %q, want refs/heads/feature (main quarantined)", got)
+	}
+
+	// Every branch tainted → HEAD orphaned, nothing servable.
+	repo2 := makeBareRepoWithBranches(t, "main", "master")
+	id2, _ := st.UpsertRepo(ctx, "https://h/o/r2", repo2)
+	st.SetVerdict(id2, "refs/heads/main", verdict.DecisionQuarantined, "secret")
+	st.SetVerdict(id2, "refs/heads/master", verdict.DecisionQuarantined, "secret")
+	if err := r.ReconcileRepo(ctx, id2, repo2); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := exec.Command("git", "--git-dir", repo2, "rev-parse", "-q", "--verify", "HEAD").Output(); len(out) != 0 {
+		t.Fatalf("fully-quarantined repo still resolves HEAD to %q — would leak on clone", strings.TrimSpace(string(out)))
 	}
 }
 
