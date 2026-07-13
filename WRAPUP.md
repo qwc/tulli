@@ -139,6 +139,28 @@ DB, so the deep lane scans offline.
 > fixture repo with a known-vulnerable dependency for Trivy. The stack is wired;
 > the guided demo of the web/CVE/triage flows is the remaining piece.
 
+#### Real repos for a live demo
+The scripted `demo.sh` uses synthetic fixtures for a fast, offline arc. For a
+*live* demo against real upstreams (compose defaults to `https://`), these three
+exercise both scanning lanes (verified: gitleaks v8.21.2 fires on the two secret
+repos; NodeGoat/railsgoat ship lockfiles Trivy turns into CVEs):
+
+```sh
+# secrets → auto-quarantine (fast lane, gitleaks)
+git clone http://localhost:8080/repos/github.com/trufflesecurity/test_keys   # tiny: 3 HIGH (2 aws-access-token, 1 private-key), revoked/safe
+git clone http://localhost:8080/repos/github.com/Plazmaz/leaky-repo          # heavier: ~235 findings across ~40 rule types (breadth for the findings UI)
+
+# vulnerable dependencies → triage queue (deep lane, Trivy — never auto-blocks)
+git clone http://localhost:8080/repos/github.com/OWASP/NodeGoat              # package-lock.json with deliberately outdated npm deps → many CVEs
+```
+
+First fetch fans out to both lanes automatically. Notes: real secret repos carry
+the secrets *on the default branch*, so you get whole-repo/default-branch
+quarantine — the "clean main + one hidden evil ref" shape is what the synthetic
+`demo.sh` fixture demonstrates instead. CVEs land in the **Triage** tab a bit
+after the clone (deep lane); secrets quarantine near-immediately. `OWASP/railsgoat`
+(`Gemfile.lock`, Ruby) is a good alternate CVE target.
+
 ### Tests
 ```sh
 go test ./...                 # full suite (real Postgres via embedded-postgres)
