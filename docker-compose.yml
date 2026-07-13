@@ -32,7 +32,19 @@ services:
     #   - "5433:5432"
 
   tulli:
-    build: .
+    build:
+      context: .
+      # Behind a TLS-inspecting proxy (Zscaler etc.): drop your root CA into
+      # certs/ (see certs/README.md) and the image trusts it for both the build
+      # downloads and tulli's runtime upstream fetches. If your proxy is also an
+      # *explicit* proxy, uncomment these so the build downloads route through it.
+      # APT_MIRROR points the base packages at an internal Debian mirror instead
+      # of deb.debian.org (keep it HTTP — packages are GPG-signed).
+      # args:
+      #   HTTP_PROXY: "${HTTP_PROXY:-}"
+      #   HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      #   NO_PROXY: "${NO_PROXY:-}"
+      #   APT_MIRROR: "${APT_MIRROR:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,6 +68,11 @@ services:
       # random value (and TULLI_WEB_SECURE_COOKIES=true behind TLS) in prod.
       TULLI_SESSION_SECRET: "${TULLI_SESSION_SECRET:-dev-insecure-session-secret-change-me}"
       TULLI_WEB_SECURE_COOKIES: "${TULLI_WEB_SECURE_COOKIES:-false}"
+      # Explicit proxy at runtime? tulli's git clones + trivy DB refresh honour
+      # these (trust for the proxy's CA comes from certs/, baked in at build).
+      # HTTP_PROXY: "${HTTP_PROXY:-}"
+      # HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      # NO_PROXY: "${NO_PROXY:-postgres,localhost,127.0.0.1}"
     volumes:
       # Local fixtures for the file:// demo (unused when upstream is https://).
       - ./demo/fixtures:/fixtures:ro

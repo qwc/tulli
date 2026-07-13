@@ -106,6 +106,35 @@ SQL `INSERT`, standing in for the stage-6 web API) and watches the reconcile
 sweep lift the block. `TULLI_RECONCILE_INTERVAL` is set to `3s` in compose so the
 lift is quick.
 
+### Behind a corporate proxy (Zscaler etc.)
+
+If you build or run tulli behind a **TLS-inspecting proxy**, its root CA has to
+be trusted or the image build (fetching gitleaks/trivy, the trivy vuln DB) and
+serving (tulli's HTTPS `git` fetches) fail on certificate verification. Drop your
+proxy's root CA — PEM, `.crt` extension — into **`certs/`** and rebuild:
+
+```sh
+cp /path/to/zscaler-root.crt certs/
+docker compose build          # or: docker build .
+```
+
+The Dockerfile installs everything in `certs/*.crt` into the system trust store
+in both build stages, so `git`, `curl`, `trivy`, and the Go binary all trust it —
+at build time *and* at runtime. Empty `certs/` (the default) is a no-op. The
+dropped files are git-ignored so you don't commit your org's internal CA. See
+[`certs/README.md`](certs/README.md).
+
+Two more knobs for locked-down networks (all optional, all in
+`docker-compose.yml` / `--build-arg`):
+
+- **Explicit (non-transparent) proxy** — route traffic through it with
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (build args for the image downloads, env
+  for tulli's runtime `git`/`trivy` fetches). The proxy CA still comes from `certs/`.
+- **Internal Debian mirror** — if `deb.debian.org` is unreachable, point the base
+  packages at your mirror: `--build-arg APT_MIRROR=http://apt.corp/debian` (it
+  rewrites both `…/debian` and `…/debian-security`). Keep it HTTP where you can —
+  Debian packages are GPG-signed, so the transport needs no TLS trust.
+
 ## Test
 
 ```sh

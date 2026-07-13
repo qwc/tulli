@@ -4,3 +4,7 @@ data/
 demo/fixtures/
 *.md
 tulli
+# certs/ holds custom CA roots the Dockerfile installs; keep the .crt files but
+# not the docs (`*.md` above doesn't match nested paths). The tracked .keep
+# placeholder keeps `COPY certs/` working when no certs have been added.
+certs/README.md

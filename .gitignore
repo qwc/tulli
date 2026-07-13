@@ -9,3 +9,9 @@
 
 # local MCP config — contains a Forgejo access token, never commit
 /.mcp.json
+
+# corporate CA roots dropped in for the build (Zscaler etc.) — keep them local,
+# don't commit an organisation's internal CA. Only the placeholder + docs track.
+/certs/*
+!/certs/.keep
+!/certs/README.md
