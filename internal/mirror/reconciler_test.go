@@ -227,3 +227,88 @@ func TestSweep_OverrideRecomputesAndClears(t *testing.T) {
 		t.Fatalf("after override, hidden = %v, want cleared", got)
 	}
 }
+
+// fakeRemover lets the prune tests control whether a dir "removes" without a real
+// mirror/FS, and records what it was asked to remove.
+type fakeRemover struct {
+	removed bool
+	err     error
+	paths   []string
+}
+
+func (f *fakeRemover) Remove(_ context.Context, path string) (bool, error) {
+	f.paths = append(f.paths, path)
+	return f.removed, f.err
+}
+
+// TestPruneDeleted_RemovesDirThenRow is the #24 happy path: a tombstoned repo has
+// its on-disk mirror removed and then its DB row hard-deleted, and it re-mirrors
+// clean afterwards (the row is truly gone).
+func TestPruneDeleted_RemovesDirThenRow(t *testing.T) {
+	repo := makeBareRepo(t)
+	st := store.NewMem()
+	ctx := context.Background()
+	id, _ := st.UpsertRepo(ctx, "https://h/o/r", repo)
+	// A child row proves the mem cascade clears state, not just the repo entry.
+	_ = st.InsertFinding(ctx, 0, id, "refs/heads/x", verdict.Finding{Scanner: "gitleaks", Severity: verdict.SeverityHigh, Fingerprint: "fp"})
+	if err := st.MarkRepoDeleted(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	rem := &fakeRemover{removed: true}
+	r := NewReconciler(st, discardLogger()).WithRemover(rem)
+	r.PruneDeleted(ctx)
+
+	if len(rem.paths) != 1 || rem.paths[0] != repo {
+		t.Fatalf("remover asked for %v, want [%s]", rem.paths, repo)
+	}
+	if _, found, _ := st.RepoByID(ctx, id); found {
+		t.Fatal("repo row should be hard-deleted after prune")
+	}
+	if dels, _ := st.DeletedRepos(ctx); len(dels) != 0 {
+		t.Fatalf("DeletedRepos = %v, want empty after prune", dels)
+	}
+	// A later fetch of the same URL re-mirrors from a clean slate (new id).
+	newID, _ := st.UpsertRepo(ctx, "https://h/o/r", repo)
+	if newID == id {
+		t.Fatalf("re-mirror reused id %d; expected a fresh row", id)
+	}
+	if fs, _ := st.FindingsForRef(ctx, newID, "refs/heads/x"); len(fs) != 0 {
+		t.Fatalf("re-mirrored repo carried stale findings %v", fs)
+	}
+}
+
+// TestPruneDeleted_SkipsWhenBusy: if the mirror can't be removed yet (a clone is
+// in-flight → removed=false), the row must stay tombstoned for the next sweep,
+// never hard-deleted while the dir is still present (the unscanned-serve footgun).
+func TestPruneDeleted_SkipsWhenBusy(t *testing.T) {
+	st := store.NewMem()
+	ctx := context.Background()
+	id, _ := st.UpsertRepo(ctx, "https://h/o/r", "/mirrors/h/o/r.git")
+	_ = st.MarkRepoDeleted(ctx, id)
+
+	rem := &fakeRemover{removed: false} // busy
+	r := NewReconciler(st, discardLogger()).WithRemover(rem)
+	r.PruneDeleted(ctx)
+
+	if _, found, _ := st.RepoByID(ctx, id); !found {
+		t.Fatal("row must NOT be deleted while its dir is still present")
+	}
+	dels, _ := st.DeletedRepos(ctx)
+	if len(dels) != 1 {
+		t.Fatalf("DeletedRepos = %v, want the repo still queued for retry", dels)
+	}
+}
+
+// TestPruneDeleted_NoRemover: pruning is a no-op (and safe) when no remover is
+// wired — the tombstone simply persists.
+func TestPruneDeleted_NoRemover(t *testing.T) {
+	st := store.NewMem()
+	ctx := context.Background()
+	id, _ := st.UpsertRepo(ctx, "https://h/o/r", "/m/r.git")
+	_ = st.MarkRepoDeleted(ctx, id)
+	NewReconciler(st, discardLogger()).PruneDeleted(ctx) // no WithRemover
+	if _, found, _ := st.RepoByID(ctx, id); !found {
+		t.Fatal("without a remover the row should be untouched")
+	}
+}

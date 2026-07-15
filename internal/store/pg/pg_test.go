@@ -213,6 +213,65 @@ func TestPG_ScanFindingsAndRecompute(t *testing.T) {
 	}
 }
 
+// TestPG_RepoRemovalTombstone exercises the #24 removal arc on real Postgres
+// (migration 00005 applied): mark → LookupRepo reports tombstoned → ListRepos
+// hides it while DeletedRepos surfaces it → DeleteRepo hard-deletes with FK
+// cascade → LookupRepo no longer finds it.
+func TestPG_RepoRemovalTombstone(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	id, err := s.UpsertRepo(ctx, "https://h/o/gone", "/m/gone.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A child row proves the FK cascade removes dependents on DeleteRepo.
+	scanID, err := s.InsertScan(ctx, id, "gitleaks", "RANGE", "--all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFinding(ctx, scanID, id, "refs/heads/x",
+		verdict.Finding{Scanner: "gitleaks", Severity: verdict.SeverityHigh, Fingerprint: "fp"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Live: LookupRepo finds it, not tombstoned.
+	if gotID, deleted, found, err := s.LookupRepo(ctx, "https://h/o/gone"); err != nil || !found || deleted || gotID != id {
+		t.Fatalf("LookupRepo(live) = %d,%v,%v,%v", gotID, deleted, found, err)
+	}
+
+	// Mark removed → tombstoned, hidden from the list, queued for prune.
+	if err := s.MarkRepoDeleted(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, deleted, _, _ := s.LookupRepo(ctx, "https://h/o/gone"); !deleted {
+		t.Fatal("LookupRepo should report tombstoned after mark")
+	}
+	if repos, _ := s.ListRepos(ctx); len(repos) != 0 {
+		t.Fatalf("ListRepos = %v, want tombstoned repo hidden", repos)
+	}
+	dels, err := s.DeletedRepos(ctx)
+	if err != nil || len(dels) != 1 || dels[0].ID != id {
+		t.Fatalf("DeletedRepos = %v, %v, want [%d]", dels, err, id)
+	}
+
+	// Finalize: hard-delete cascades to the finding, and LookupRepo misses.
+	if err := s.DeleteRepo(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, found, _ := s.LookupRepo(ctx, "https://h/o/gone"); found {
+		t.Fatal("LookupRepo should miss after DeleteRepo")
+	}
+	if fs, err := s.FindingsForRef(ctx, id, "refs/heads/x"); err != nil || len(fs) != 0 {
+		t.Fatalf("findings after cascade = %v, %v, want none", fs, err)
+	}
+}
+
 // TestPG_AuthLookups exercises stage-6a identity on real Postgres: a user with a
 // role/kind, an SSH key, and a token all round-trip through the auth.Store
 // lookups (migration 00004 applied), and unknown credentials do not resolve.

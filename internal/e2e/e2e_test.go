@@ -111,6 +111,7 @@ type stack struct {
 	st         *store.Mem
 	worker     *scan.Worker
 	reconciler *mirror.Reconciler
+	mir        *git.Mirror
 }
 
 // newStack wires the full real stack (gate + async scan worker + reconciler)
@@ -128,7 +129,7 @@ func newStack(t *testing.T, upstreamBase string, scanner scan.Scanner) *stack {
 	mirrors := filepath.Join(t.TempDir(), "mirrors")
 	mir := git.NewMirror(mirrors, upstreamBase, discardLogger())
 	st := store.NewMem()
-	reconciler := mirror.NewReconciler(st, discardLogger())
+	reconciler := mirror.NewReconciler(st, discardLogger()).WithRemover(mir)
 	worker := scan.NewWorker(scanner, st, git.RefsContaining, reconciler, discardLogger())
 	go worker.Run(ctx)
 
@@ -136,7 +137,7 @@ func newStack(t *testing.T, upstreamBase string, scanner scan.Scanner) *stack {
 	srv := httpsrv.New(gate, auth.NewDBProvider(st), backend, discardLogger())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return &stack{ts: ts, mirrors: mirrors, st: st, worker: worker, reconciler: reconciler}
+	return &stack{ts: ts, mirrors: mirrors, st: st, worker: worker, reconciler: reconciler, mir: mir}
 }
 
 func TestE2E_CloneThroughProxy(t *testing.T) {
@@ -260,6 +261,60 @@ func TestE2E_RepoWideQuarantineBlocksClone(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "QUARANTINED") || !strings.Contains(string(out), "gitleaks") {
 		t.Fatalf("clone failed but without our block message:\n%s", out)
+	}
+}
+
+// TestE2E_RemoveRepo is the #24 arc end to end: clone (mirror created) → mark
+// removed → the gate goes inert (clone blocked, no re-mirror) → reconciler prunes
+// the dir and hard-deletes the row → a fresh clone re-mirrors from scratch.
+func TestE2E_RemoveRepo(t *testing.T) {
+	up := t.TempDir()
+	makeUpstream(t, filepath.Join(up, "example.com/acme/widget"), "hello\n")
+	s := newStack(t, "file://"+up, noopScanner{})
+	ts, st := s.ts, s.st
+	base := "file://" + up
+	url := ts.URL + "/repos/example.com/acme/widget"
+	mirrorDir := filepath.Join(s.mirrors, "example.com/acme/widget.git")
+
+	// First clone materialises the mirror and registers the repo.
+	run(t, "", "git", "clone", "-q", url, filepath.Join(t.TempDir(), "before"))
+	id, ok := st.RepoID(git.RepoRef{Host: "example.com", Path: "acme/widget"}.UpstreamURL(base))
+	if !ok {
+		t.Fatal("repo not registered after first clone")
+	}
+	if _, err := os.Stat(mirrorDir); err != nil {
+		t.Fatalf("mirror not on disk: %v", err)
+	}
+
+	// Admin requests removal (stand-in for the web DELETE, like SetVerdict elsewhere).
+	if err := st.MarkRepoDeleted(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	// The gate is immediately inert: a clone is refused and the mirror is NOT rebuilt.
+	cmd := exec.Command("git", "clone", "-q", url, filepath.Join(t.TempDir(), "during"))
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("clone of a repo being removed should fail; output:\n%s", out)
+	} else if !strings.Contains(string(out), "being removed") {
+		t.Fatalf("clone failed but without our removal message:\n%s", out)
+	}
+
+	// The reconciler prunes the dir and finalizes the row deletion.
+	if err := s.reconciler.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mirrorDir); !os.IsNotExist(err) {
+		t.Fatalf("mirror dir should be gone after prune; stat err = %v", err)
+	}
+	if _, found, _ := st.RepoByID(context.Background(), id); found {
+		t.Fatal("repo row should be hard-deleted after prune")
+	}
+
+	// A later clone re-mirrors from a clean slate (fresh row).
+	run(t, "", "git", "clone", "-q", url, filepath.Join(t.TempDir(), "after"))
+	newID, ok := st.RepoID(git.RepoRef{Host: "example.com", Path: "acme/widget"}.UpstreamURL(base))
+	if !ok || newID == id {
+		t.Fatalf("re-mirror should assign a fresh id; got %d (old %d, ok=%v)", newID, id, ok)
 	}
 }
 

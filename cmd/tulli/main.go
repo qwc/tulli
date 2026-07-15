@@ -126,7 +126,7 @@ func main() {
 	// Reconciler (mirror-owning process): applies DB verdicts to on-disk hideRefs;
 	// its periodic sweep also recomputes verdicts written out of process (the
 	// future web API). Scan worker: fail-open-once gitleaks off the request path.
-	reconciler := mirror.NewReconciler(st, log).WithNotifier(notify.NewLogNotifier(log))
+	reconciler := mirror.NewReconciler(st, log).WithNotifier(notify.NewLogNotifier(log)).WithRemover(m)
 	worker := scan.NewWorker(scan.NewGitleaks(), st, git.RefsContaining, reconciler, log)
 	go worker.Run(ctx)
 	go reconciler.Run(ctx, *reconcile)

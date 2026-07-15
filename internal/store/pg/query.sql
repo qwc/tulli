@@ -9,10 +9,28 @@ INSERT INTO access_events (repo_id, user_id, source_ip, http_status, bytes)
 VALUES ($1, sqlc.narg('user_id'), sqlc.narg('source_ip')::inet, $2, $3);
 
 -- name: ListRepos :many
-SELECT id, upstream_url, mirror_path FROM repos ORDER BY id;
+-- Tombstoned repos (#24, removal requested) are hidden from the list immediately.
+SELECT id, upstream_url, mirror_path FROM repos WHERE deleted_at IS NULL ORDER BY id;
 
 -- name: RepoByID :one
 SELECT id, upstream_url, mirror_path FROM repos WHERE id = $1;
+
+-- name: LookupRepo :one
+-- Hot-path pre-ensure lookup (#24): resolve a repo by URL and its tombstone
+-- timestamp, so the gate can go inert (block, do not re-mirror) during removal.
+SELECT id, deleted_at FROM repos WHERE upstream_url = $1;
+
+-- name: MarkRepoDeleted :exec
+-- Record removal intent (#24). The reconciler prunes + hard-deletes on its sweep.
+UPDATE repos SET deleted_at = NOW() WHERE id = $1;
+
+-- name: DeletedRepos :many
+-- Tombstoned repos awaiting prune by the reconciler (#24).
+SELECT id, upstream_url, mirror_path FROM repos WHERE deleted_at IS NOT NULL ORDER BY id;
+
+-- name: DeleteRepo :exec
+-- Finalize removal (#24): hard-delete the row; FK cascade drops all children.
+DELETE FROM repos WHERE id = $1;
 
 -- Stage 6a: identity & access (auth.Store).
 

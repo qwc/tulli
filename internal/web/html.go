@@ -276,6 +276,22 @@ func (s *Server) htmlOverride(w http.ResponseWriter, r *http.Request, me auth.Id
 	http.Redirect(w, r, repoPath(id), http.StatusSeeOther)
 }
 
+// htmlDelete requests removal of a repo (#24, admin-only). On success the repo is
+// tombstoned and disappears from the list, so redirect there rather than to the
+// (now-inert) detail page.
+func (s *Server) htmlDelete(w http.ResponseWriter, r *http.Request, me auth.Identity) {
+	id, ok := pathIDVal(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if ie := s.applyDelete(r.Context(), id, me.Login); ie != nil {
+		s.renderRepo(w, r.Context(), me, id, ie.msg, ie.code)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // --- account (self-service key upload) ---
 
 type accountView struct {

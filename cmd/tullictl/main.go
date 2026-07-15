@@ -9,6 +9,7 @@
 //
 //	tullictl repos
 //	tullictl repo <id>
+//	tullictl repo-rm <id>                             (admin; removes mirror + all data)
 //	tullictl block   <repoID> <ref|-> <reason...>     (- = repo-wide)
 //	tullictl unblock <repoID> <ref|-> <reason...>
 //	tullictl override <repoID> <ref|-> <fingerprint> <reason...>
@@ -44,6 +45,8 @@ func main() {
 		err = c.get("/api/repos")
 	case "repo":
 		err = needN(args, 1, "repo <id>", func() error { return c.get("/api/repos/" + args[0]) })
+	case "repo-rm":
+		err = needN(args, 1, "repo-rm <id>", func() error { return c.del("/api/repos/" + args[0]) })
 	case "block":
 		err = blockCmd(c, args, "block")
 	case "unblock":
@@ -114,6 +117,7 @@ func (c *client) get(path string) error { return c.do(http.MethodGet, path, nil)
 func (c *client) post(path string, body any) error {
 	return c.do(http.MethodPost, path, body)
 }
+func (c *client) del(path string) error { return c.do(http.MethodDelete, path, nil) }
 
 func (c *client) do(method, path string, body any) error {
 	var buf io.Reader
@@ -162,6 +166,7 @@ tullictl — client for the tulli web API (set TULLI_URL, TULLI_TOKEN)
 
   repos
   repo          <id>
+  repo-rm       <id>                             (admin; removes mirror + all data)
   block         <repoID> <ref|-> <reason...>     (- = repo-wide)
   unblock       <repoID> <ref|-> <reason...>
   override      <repoID> <ref|-> <fingerprint> <reason...>

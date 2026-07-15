@@ -130,6 +130,44 @@ func (s *Store) RepoByID(ctx context.Context, id int64) (core.RepoInfo, bool, er
 	return core.RepoInfo{ID: r.ID, UpstreamURL: r.UpstreamUrl, MirrorPath: r.MirrorPath}, true, nil
 }
 
+// --- #24: repo removal (transient tombstone) ---
+
+// LookupRepo resolves a repo by URL for the gate's pre-ensure tombstone check.
+// id 0 (found == false) means the repo is not mirrored yet.
+func (s *Store) LookupRepo(ctx context.Context, upstreamURL string) (id int64, deleted bool, found bool, err error) {
+	r, err := s.q.LookupRepo(ctx, upstreamURL)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, false, nil
+		}
+		return 0, false, false, err
+	}
+	return r.ID, r.DeletedAt.Valid, true, nil
+}
+
+// MarkRepoDeleted records removal intent (web writes; reconciler prunes).
+func (s *Store) MarkRepoDeleted(ctx context.Context, id int64) error {
+	return s.q.MarkRepoDeleted(ctx, id)
+}
+
+// DeletedRepos lists tombstoned repos awaiting prune by the reconciler.
+func (s *Store) DeletedRepos(ctx context.Context) ([]core.RepoInfo, error) {
+	rows, err := s.q.DeletedRepos(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.RepoInfo, len(rows))
+	for i, r := range rows {
+		out[i] = core.RepoInfo{ID: r.ID, UpstreamURL: r.UpstreamUrl, MirrorPath: r.MirrorPath}
+	}
+	return out, nil
+}
+
+// DeleteRepo hard-deletes a repo row (FK cascade drops all children).
+func (s *Store) DeleteRepo(ctx context.Context, id int64) error {
+	return s.q.DeleteRepo(ctx, id)
+}
+
 func (s *Store) InsertScan(ctx context.Context, repoID int64, scanner, scopeKind, scopeExpr string) (int64, error) {
 	return s.q.InsertScan(ctx, sqlc.InsertScanParams{
 		RepoID: repoID, Scanner: scanner, ScopeKind: scopeKind, ScopeExpr: ptr(scopeExpr),

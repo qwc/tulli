@@ -117,4 +117,17 @@
 </div>
 <p class="muted">Writes are desired state; the reconciler applies them to the mirror on its next sweep.</p>
 {{end}}
+
+{{if canAdmin .Me.Role}}
+<fieldset>
+  <legend>Danger zone</legend>
+  <p class="muted">Remove this mirror entirely — deletes the on-disk mirror and all
+  records (findings, verdicts, waivers, triage). Irreversible. A later fetch of the
+  same URL re-mirrors from scratch.</p>
+  <form method="post" action="/repos/{{.Data.ID}}/delete"
+        onsubmit="return confirm('Remove this repository and all its data? This cannot be undone.');">
+    <button class="danger" type="submit">Remove repository</button>
+  </form>
+</fieldset>
+{{end}}
 {{end}}

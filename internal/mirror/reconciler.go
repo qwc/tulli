@@ -27,11 +27,22 @@ type Store interface {
 	ResolveVerdict(ctx context.Context, repoID int64) (core.Verdict, error)
 	RecipientsForRepo(ctx context.Context, repoID int64) ([]core.Recipient, error)
 	RecordNotificationForLatestVerdict(ctx context.Context, repoID int64, ref string, recipients []int64, payloadPath string) (bool, error)
+	// #24 repo removal: tombstoned repos to prune, and the finalizing hard-delete.
+	DeletedRepos(ctx context.Context) ([]core.RepoInfo, error)
+	DeleteRepo(ctx context.Context, repoID int64) error
+}
+
+// Remover deletes a bare mirror from disk (implemented by *git.Mirror). It is the
+// mirror-owning half of repo removal (#24): the reconciler prunes the dir here,
+// then finalizes the DB row. A nil remover disables pruning (removal never runs).
+type Remover interface {
+	Remove(ctx context.Context, path string) (removed bool, err error)
 }
 
 type Reconciler struct {
 	store    Store
 	notifier notify.Notifier // nil = notifications disabled
+	remover  Remover         // nil = repo pruning disabled (#24)
 	log      *slog.Logger
 }
 
@@ -43,6 +54,13 @@ func NewReconciler(store Store, log *slog.Logger) *Reconciler {
 // reconciler for chaining.
 func (r *Reconciler) WithNotifier(n notify.Notifier) *Reconciler {
 	r.notifier = n
+	return r
+}
+
+// WithRemover enables tombstoned-repo pruning (#24). Returns the reconciler for
+// chaining.
+func (r *Reconciler) WithRemover(m Remover) *Reconciler {
+	r.remover = m
 	return r
 }
 
@@ -118,6 +136,11 @@ func (r *Reconciler) notifyQuarantine(ctx context.Context, repoID int64, repoPat
 // which is how the web API (and the stage-4 demo's override scaffold) actuate —
 // then reconciles hideRefs. writeIfChanged keeps this idempotent.
 func (r *Reconciler) Sweep(ctx context.Context) error {
+	// Prune tombstoned repos first (#24): a removed repo has no verdicts to
+	// reconcile, and doing it up front means a re-mirror later in the same sweep
+	// window starts clean.
+	r.PruneDeleted(ctx)
+
 	repos, err := r.store.ListRepos(ctx)
 	if err != nil {
 		return err
@@ -132,6 +155,40 @@ func (r *Reconciler) Sweep(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// PruneDeleted removes tombstoned repos (#24), dir-first: it deletes the on-disk
+// bare mirror and, only on a successful remove, hard-deletes the DB row (cascade
+// drops the children). The order is load-bearing — a row must never outlive its
+// dir being present, or the next fetch would re-upsert, find the existing mirror
+// (created == false), skip the scan, and serve unscanned. A skipped prune (clone
+// in-flight) leaves the row tombstoned and inert; the next sweep retries. No-op
+// if no remover was wired.
+func (r *Reconciler) PruneDeleted(ctx context.Context) {
+	if r.remover == nil {
+		return
+	}
+	repos, err := r.store.DeletedRepos(ctx)
+	if err != nil {
+		r.log.Error("prune: list deleted repos failed", "err", err)
+		return
+	}
+	for _, repo := range repos {
+		removed, err := r.remover.Remove(ctx, repo.MirrorPath)
+		if err != nil {
+			r.log.Error("prune: remove mirror failed", "repo_id", repo.ID, "path", repo.MirrorPath, "err", err)
+			continue
+		}
+		if !removed {
+			r.log.Info("prune: mirror busy, will retry", "repo_id", repo.ID, "path", repo.MirrorPath)
+			continue
+		}
+		if err := r.store.DeleteRepo(ctx, repo.ID); err != nil {
+			r.log.Error("prune: delete repo row failed", "repo_id", repo.ID, "err", err)
+			continue
+		}
+		r.log.Info("repo removed", "repo_id", repo.ID, "upstream", repo.UpstreamURL)
+	}
 }
 
 // Run does a boot sweep, then sweeps every interval until ctx is cancelled.

@@ -317,6 +317,58 @@ something that later got flagged.
   records a notification once and not again on re-sweep (idempotency); recipient
   resolution from access_events; the whole arc on real PG.
 
+### #24 — Remove a mirrored repo (RESOLVED; transient tombstone)
+
+Admin-only, irreversible removal of a mirror — DB row **and** on-disk bare
+mirror — across both surfaces (`tullictl repo-rm`, web `DELETE /api/repos/{id}` +
+a UI button). The design constraint is the §4 single-writer model (the web process
+records *intent*; only the mirror-owning process touches the mirror FS) and one
+footgun: if the `repos` row is deleted while the on-disk mirror lingers, the next
+fetch re-upserts a fresh row, `EnsurePresent` finds the existing bare repo →
+`created == false` → **no re-scan** → a previously-quarantined repo serves as
+CLEAN/unscanned. Removal must never land in that state.
+
+Resolved as a **transient tombstone** — a nullable `repos.deleted_at`, set on the
+row only for the brief window between "removal requested" and "actually gone":
+
+- **Web records intent** — `DELETE /api/repos/{id}` (admin) sets `deleted_at =
+  NOW()`, returns 202. No disk touch. An HTML `POST /repos/{id}/delete` button
+  (admin, confirm dialog) does the same and 303s back to the list.
+- **The gate goes inert immediately** — this is what makes the sweep-paced latency
+  *harmless* rather than racy. `Admit` does a `LookupRepo(upstream_url)` **before**
+  `EnsurePresent`; if the row is tombstoned it blocks ("repository is being
+  removed") and, critically, does **not** re-mirror or serve the about-to-be-deleted
+  content. So the footgun window is closed by *state*, not by *speed*. (Cost: one
+  indexed SELECT on the hot fetch path, before the clone step — accepted.)
+- **The reconciler does the work, dir-first** — each sweep (and boot) it prunes
+  every tombstoned repo: `Mirror.Remove(path)` `rm -rf`s the bare dir (guarded —
+  skips if a clone is in-flight for that dir per the single-flight map, and refuses
+  any path outside the mirror root), and **only on a successful remove** does it
+  `DeleteRepo(id)` (FK-cascade drops refs/scans/findings/verdicts/overrides/blocks/
+  vuln rows). Order matters: dir gone → row gone, so a skipped/failed prune leaves
+  the row tombstoned (still inert, retried next tick), never a row-less dir that
+  serves unscanned.
+- **Re-mirror is a clean slate** — hard-delete (not a permanent soft-delete row)
+  is deliberate: a lingering tombstone row would collide with `UpsertRepo`'s
+  `ON CONFLICT (upstream_url)` and force a `deleted_at IS NULL` filter through every
+  query forever. Once the row is gone, a later fetch of the same URL lazily
+  re-mirrors from scratch (fresh `first_seen`, fresh scan).
+- **Latency** — actual disk removal is sweep-paced (`TULLI_RECONCILE_INTERVAL`,
+  30s default / 10s compose); the repo vanishes from the web list instantly
+  (`ListRepos` excludes tombstoned) and is inert at the gate instantly, so the delay
+  is invisible. A wake-up nudge (web pokes the reconciler to prune in ms) is
+  **deferred-but-unblocked** — pure UX, not correctness.
+- **Policy** — admin-only, no grace period, no undo. The admin is root: removal is
+  their responsibility (there's no "are you sure you want to rm -rf" beyond the UI
+  confirm dialog).
+- **Audit** — `access_events.repo_id` is `ON DELETE SET NULL`, so the row can't
+  anchor the record post-delete; the web handler emits an explicit removal audit
+  log line (actor + upstream URL) at request time instead.
+- **Tests.** Gate blocks a tombstoned repo before ensure (no re-mirror); reconciler
+  prune removes dir then row and skips an in-flight dir; `Mirror.Remove` refuses a
+  path outside root; web `DELETE` marks deleted + is admin-only; the mark→prune→
+  cascade arc on real PG.
+
 ---
 
 ## 6. Testing

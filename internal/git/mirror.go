@@ -98,6 +98,28 @@ func (m *Mirror) EnsurePresent(ctx context.Context, ref RepoRef) (path string, c
 	return dir, true, nil
 }
 
+// Remove deletes a bare mirror from disk (#24, repo removal). It reports removed
+// == false (and does nothing) if a clone for that dir is in-flight — the caller
+// (reconciler) retries on its next sweep, so we never rm out from under an active
+// clone. As a safety guard it refuses any path outside the mirror root. A missing
+// dir counts as removed (idempotent), so a retried prune converges.
+func (m *Mirror) Remove(_ context.Context, path string) (removed bool, err error) {
+	clean := filepath.Clean(path)
+	if clean != m.root && !strings.HasPrefix(clean, m.root+string(os.PathSeparator)) {
+		return false, fmt.Errorf("refusing to remove %q outside mirror root %q", clean, m.root)
+	}
+	m.mu.Lock()
+	if _, busy := m.inflight[clean]; busy {
+		m.mu.Unlock()
+		return false, nil // a clone is running for this dir; retry next sweep
+	}
+	m.mu.Unlock()
+	if err := os.RemoveAll(clean); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // clone materialises the mirror: it runs cloneFn into a temp dir, then
 // atomically renames it into place so isBareRepo never sees a half-written repo.
 func (m *Mirror) clone(ctx context.Context, ref RepoRef, dir string) error {

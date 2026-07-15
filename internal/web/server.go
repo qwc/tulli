@@ -50,6 +50,8 @@ type Store interface {
 	OverridesForRepo(ctx context.Context, repoID int64) ([]core.Override, error)
 	InsertManualBlock(ctx context.Context, repoID int64, ref string, active bool, reason, actor string) error
 	InsertOverride(ctx context.Context, repoID int64, ref, fingerprint, reason, actor string) error
+	// MarkRepoDeleted records removal intent (#24); the reconciler prunes.
+	MarkRepoDeleted(ctx context.Context, repoID int64) error
 	InsertUser(ctx context.Context, name string, role auth.Role, kind auth.Kind) (int64, error)
 	InsertToken(ctx context.Context, userID int64, tokenHash string) error
 	InsertSSHKey(ctx context.Context, userID int64, fingerprint, pubkey string) error
@@ -103,6 +105,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/repos/{id}/block", s.guard(auth.RoleReviewer, s.blockRef))
 	mux.HandleFunc("POST /api/repos/{id}/unblock", s.guard(auth.RoleReviewer, s.unblockRef))
 	mux.HandleFunc("POST /api/repos/{id}/overrides", s.guard(auth.RoleReviewer, s.addOverride))
+	mux.HandleFunc("DELETE /api/repos/{id}", s.guard(auth.RoleAdmin, s.deleteRepo))
 	mux.HandleFunc("POST /api/users", s.guard(auth.RoleAdmin, s.createUser))
 	mux.HandleFunc("POST /api/users/{id}/tokens", s.guard(auth.RoleAdmin, s.createToken))
 	mux.HandleFunc("POST /api/users/{id}/keys", s.guard(auth.RoleAdmin, s.addKey))
@@ -116,6 +119,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /repos/{id}/block", s.guardHTML(auth.RoleReviewer, s.htmlBlock))
 	mux.HandleFunc("POST /repos/{id}/unblock", s.guardHTML(auth.RoleReviewer, s.htmlUnblock))
 	mux.HandleFunc("POST /repos/{id}/overrides", s.guardHTML(auth.RoleReviewer, s.htmlOverride))
+	mux.HandleFunc("POST /repos/{id}/delete", s.guardHTML(auth.RoleAdmin, s.htmlDelete))
 	mux.HandleFunc("GET /account", s.guardHTML(auth.RoleViewer, s.accountPage))
 	mux.HandleFunc("POST /account/keys", s.guardHTML(auth.RoleViewer, s.accountAddKey))
 	mux.HandleFunc("GET /triage", s.guardHTML(auth.RoleReviewer, s.triagePage))
@@ -418,6 +422,18 @@ func (s *Server) addOverride(w http.ResponseWriter, r *http.Request, id auth.Ide
 	writeJSON(w, http.StatusAccepted, map[string]any{"applied": "pending reconcile"})
 }
 
+func (s *Server) deleteRepo(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	repoID, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if ie := s.applyDelete(r.Context(), repoID, id.Login); ie != nil {
+		writeErr(w, ie.code, ie.msg)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"applied": "pending reconcile"})
+}
+
 // intentError carries an HTTP status + message so the shared intent-write
 // helpers can serve both the JSON API (writeErr) and the HTML forms (re-render).
 type intentError struct {
@@ -445,6 +461,26 @@ func (s *Server) applyOverride(ctx context.Context, repoID int64, ref, fingerpri
 	if err := s.store.InsertOverride(ctx, repoID, ref, fingerprint, reason, actor); err != nil {
 		return &intentError{http.StatusInternalServerError, "write override failed"}
 	}
+	return nil
+}
+
+// applyDelete records removal intent for a repo (#24, admin-only). Irreversible:
+// the reconciler prunes the mirror and hard-deletes the row on its next sweep.
+// Shared by the JSON API and the HTML button so they cannot drift.
+func (s *Server) applyDelete(ctx context.Context, repoID int64, actor string) *intentError {
+	rp, found, err := s.store.RepoByID(ctx, repoID)
+	if err != nil {
+		return &intentError{http.StatusInternalServerError, "repo lookup failed"}
+	}
+	if !found {
+		return &intentError{http.StatusNotFound, "no such repo"}
+	}
+	if err := s.store.MarkRepoDeleted(ctx, repoID); err != nil {
+		return &intentError{http.StatusInternalServerError, "mark repo deleted failed"}
+	}
+	// access_events.repo_id is ON DELETE SET NULL, so the row cannot anchor this
+	// after the reconciler finalizes the delete; record the removal explicitly.
+	s.log.Info("repo removal requested", "repo_id", repoID, "upstream", rp.UpstreamURL, "actor", actor)
 	return nil
 }
 

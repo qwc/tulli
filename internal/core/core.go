@@ -134,6 +134,10 @@ type Store interface {
 	// ResolveVerdict returns the current enforcement verdict for a repo
 	// (most-specific-wins over the verdicts table, spec §6.3).
 	ResolveVerdict(ctx context.Context, repoID int64) (Verdict, error)
+	// LookupRepo resolves a repo by upstream URL and whether it is tombstoned
+	// (#24, removal requested), for the gate's pre-ensure inert check. found ==
+	// false means the repo is not mirrored yet.
+	LookupRepo(ctx context.Context, upstreamURL string) (id int64, deleted bool, found bool, err error)
 }
 
 // Gatekeeper runs the policy pipeline: resolve → ensure → gate → (enqueue scan).
@@ -165,6 +169,18 @@ func (g *Gatekeeper) Admit(ctx context.Context, ref git.RepoRef, verb string, id
 			Verb:     verb,
 			BlockMsg: "tulli is a read-only proxy; push (git-receive-pack) is not supported",
 		}, nil
+	}
+
+	// Tombstone check (#24): if this repo has a pending removal, go inert BEFORE
+	// ensuring the mirror — do not serve the about-to-be-deleted content and do
+	// not re-mirror it. This closes the removal window by state (not by prune
+	// speed): a fetch that arrives while the reconciler hasn't pruned yet is
+	// blocked here. A lookup error fails open (availability), like the gate below.
+	if id, deleted, found, lerr := g.store.LookupRepo(ctx, g.mirror.UpstreamURL(ref)); lerr != nil {
+		g.log.Error("repo tombstone lookup failed; proceeding", "ref", ref.String(), "err", lerr)
+	} else if found && deleted {
+		return Admission{Allowed: false, RepoID: id, Verb: verb,
+			BlockMsg: "tulli: repository is being removed"}, nil
 	}
 
 	dir, created, err := g.mirror.EnsurePresent(ctx, ref)

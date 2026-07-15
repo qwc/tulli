@@ -90,6 +90,7 @@ type Repo struct {
 	FirstSeen   pgtype.Timestamptz
 	LastSynced  pgtype.Timestamptz
 	ScanFloor   pgtype.Timestamptz
+	DeletedAt   pgtype.Timestamptz
 }
 
 type RepoRef struct {

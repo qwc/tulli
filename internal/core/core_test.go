@@ -45,6 +45,11 @@ type fakeStore struct {
 	insErr   error
 	verdict  Verdict
 	verdErr  error
+
+	// #24 tombstone: when tombstoned, LookupRepo reports the repo as removal-pending.
+	tombstoned bool
+	lookErr    error
+	lookups    int
 }
 
 func (f *fakeStore) UpsertRepo(_ context.Context, upstreamURL, _ string) (int64, error) {
@@ -58,6 +63,16 @@ func (f *fakeStore) InsertAccessEvent(_ context.Context, a Access) error {
 }
 func (f *fakeStore) ResolveVerdict(_ context.Context, _ int64) (Verdict, error) {
 	return f.verdict, f.verdErr
+}
+func (f *fakeStore) LookupRepo(_ context.Context, _ string) (int64, bool, bool, error) {
+	f.lookups++
+	if f.lookErr != nil {
+		return 0, false, false, f.lookErr
+	}
+	if f.tombstoned {
+		return f.repoID, true, true, nil
+	}
+	return 0, false, false, nil // not found = normal lazy-mirror path
 }
 
 type fakeEnqueuer struct{ reqs []ScanRequest }
@@ -81,6 +96,51 @@ func TestAdmit_UploadPackAllowedAndRecordsRepo(t *testing.T) {
 	}
 	if fs.upserts != 1 || fs.upstream != "https://github.com/o/r" {
 		t.Errorf("repo upsert = %d, upstream %q", fs.upserts, fs.upstream)
+	}
+}
+
+// TestAdmit_TombstonedRepoBlockedBeforeEnsure is the #24 guard: a repo with a
+// pending removal must be blocked at the gate BEFORE EnsurePresent, so tulli
+// neither serves the about-to-be-deleted content nor re-mirrors it.
+func TestAdmit_TombstonedRepoBlockedBeforeEnsure(t *testing.T) {
+	fm := &fakeMirror{dir: "/mirrors/github.com/o/r.git"}
+	fs := &fakeStore{repoID: 9, tombstoned: true}
+	g := New(fm, fs, nil, discardLogger())
+
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "github.com", Path: "o/r"}, git.VerbUploadPack, auth.Anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adm.Allowed {
+		t.Fatal("a tombstoned repo must be blocked")
+	}
+	if !strings.Contains(adm.BlockMsg, "being removed") {
+		t.Errorf("block msg = %q, want it to mention removal", adm.BlockMsg)
+	}
+	if adm.RepoID != 9 {
+		t.Errorf("RepoID = %d, want 9 (for audit)", adm.RepoID)
+	}
+	if fm.calls != 0 {
+		t.Errorf("EnsurePresent calls = %d, want 0 — must not re-mirror a repo being removed", fm.calls)
+	}
+	if fs.upserts != 0 {
+		t.Errorf("upserts = %d, want 0 — a tombstoned repo must not be re-upserted", fs.upserts)
+	}
+}
+
+// TestAdmit_LookupErrorFailsOpen: a tombstone-lookup error must not take down the
+// fetch (availability), it proceeds to ensure+serve like the other gate failures.
+func TestAdmit_LookupErrorFailsOpen(t *testing.T) {
+	fm := &fakeMirror{dir: "/mirrors/h/o/r.git"}
+	fs := &fakeStore{repoID: 3, lookErr: errors.New("db down")}
+	g := New(fm, fs, nil, discardLogger())
+
+	adm, err := g.Admit(context.Background(), git.RepoRef{Host: "h", Path: "o/r"}, git.VerbUploadPack, auth.Anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !adm.Allowed || fm.calls != 1 {
+		t.Fatalf("lookup error should fail open and serve; adm=%+v calls=%d", adm, fm.calls)
 	}
 }
 

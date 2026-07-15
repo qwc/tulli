@@ -8,6 +8,8 @@ package sqlc
 import (
 	"context"
 	"net/netip"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const activeManualBlock = `-- name: ActiveManualBlock :one
@@ -109,6 +111,47 @@ func (q *Queries) CurrentQuarantines(ctx context.Context, repoID int64) ([]Curre
 	for rows.Next() {
 		var i CurrentQuarantinesRow
 		if err := rows.Scan(&i.Ref, &i.Reason); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const deleteRepo = `-- name: DeleteRepo :exec
+DELETE FROM repos WHERE id = $1
+`
+
+// Finalize removal (#24): hard-delete the row; FK cascade drops all children.
+func (q *Queries) DeleteRepo(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, deleteRepo, id)
+	return err
+}
+
+const deletedRepos = `-- name: DeletedRepos :many
+SELECT id, upstream_url, mirror_path FROM repos WHERE deleted_at IS NOT NULL ORDER BY id
+`
+
+type DeletedReposRow struct {
+	ID          int64
+	UpstreamUrl string
+	MirrorPath  string
+}
+
+// Tombstoned repos awaiting prune by the reconciler (#24).
+func (q *Queries) DeletedRepos(ctx context.Context) ([]DeletedReposRow, error) {
+	rows, err := q.db.Query(ctx, deletedRepos)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DeletedReposRow
+	for rows.Next() {
+		var i DeletedReposRow
+		if err := rows.Scan(&i.ID, &i.UpstreamUrl, &i.MirrorPath); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -452,7 +495,7 @@ func (q *Queries) ListPendingTriage(ctx context.Context) ([]ListPendingTriageRow
 }
 
 const listRepos = `-- name: ListRepos :many
-SELECT id, upstream_url, mirror_path FROM repos ORDER BY id
+SELECT id, upstream_url, mirror_path FROM repos WHERE deleted_at IS NULL ORDER BY id
 `
 
 type ListReposRow struct {
@@ -461,6 +504,7 @@ type ListReposRow struct {
 	MirrorPath  string
 }
 
+// Tombstoned repos (#24, removal requested) are hidden from the list immediately.
 func (q *Queries) ListRepos(ctx context.Context) ([]ListReposRow, error) {
 	rows, err := q.db.Query(ctx, listRepos)
 	if err != nil {
@@ -517,6 +561,24 @@ func (q *Queries) ListUsers(ctx context.Context) ([]ListUsersRow, error) {
 	return items, nil
 }
 
+const lookupRepo = `-- name: LookupRepo :one
+SELECT id, deleted_at FROM repos WHERE upstream_url = $1
+`
+
+type LookupRepoRow struct {
+	ID        int64
+	DeletedAt pgtype.Timestamptz
+}
+
+// Hot-path pre-ensure lookup (#24): resolve a repo by URL and its tombstone
+// timestamp, so the gate can go inert (block, do not re-mirror) during removal.
+func (q *Queries) LookupRepo(ctx context.Context, upstreamUrl string) (LookupRepoRow, error) {
+	row := q.db.QueryRow(ctx, lookupRepo, upstreamUrl)
+	var i LookupRepoRow
+	err := row.Scan(&i.ID, &i.DeletedAt)
+	return i, err
+}
+
 const manualBlockRefs = `-- name: ManualBlockRefs :many
 SELECT DISTINCT ref FROM manual_blocks WHERE repo_id = $1
 `
@@ -541,6 +603,16 @@ func (q *Queries) ManualBlockRefs(ctx context.Context, repoID int64) ([]*string,
 		return nil, err
 	}
 	return items, nil
+}
+
+const markRepoDeleted = `-- name: MarkRepoDeleted :exec
+UPDATE repos SET deleted_at = NOW() WHERE id = $1
+`
+
+// Record removal intent (#24). The reconciler prunes + hard-deletes on its sweep.
+func (q *Queries) MarkRepoDeleted(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, markRepoDeleted, id)
+	return err
 }
 
 const openTriageIfAbsent = `-- name: OpenTriageIfAbsent :exec

@@ -63,10 +63,12 @@ serves git over both **HTTP** and **SSH**.
 - **Web API** (`internal/web`, own port) — the single writer of human intents
   (DB-only; reconciler applies). Bearer-token auth + bootstrap admin token.
 - **Browser UI** (server-rendered, `html/template`): token→session-cookie login
-  (no passwords), repo list + detail (findings, CVEs, block/override forms),
-  triage queue, self-service SSH-key upload, admin user management. Sessions are
-  revocable (role re-resolved every request).
-- **`tullictl`**: bearer-token CLI (kubectl shape).
+  (no passwords), repo list + detail (findings with waiver state, CVEs,
+  block/override forms), triage queue, self-service SSH-key upload, admin user
+  management, admin repo removal (danger zone). Sessions are revocable (role
+  re-resolved every request).
+- **`tullictl`**: bearer-token CLI (kubectl shape). Includes `repo-rm <id>`
+  (admin) to remove a mirror + all its data.
 
 ### Persistence & tests
 - **Postgres** (pgx + sqlc + goose) is the one real backend; `internal/store.Mem`

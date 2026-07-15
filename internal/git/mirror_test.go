@@ -31,6 +31,50 @@ func writeFakeBareRepo(dst string) error {
 	return os.WriteFile(filepath.Join(dst, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
 }
 
+// TestRemove covers #24 mirror pruning: a real dir under the root is removed, a
+// missing dir is idempotently "removed", a path outside the root is refused, and
+// an in-flight clone defers the removal.
+func TestRemove(t *testing.T) {
+	m := testMirror(t, nil)
+	ctx := context.Background()
+
+	dir := filepath.Join(m.root, "h", "o", "r.git")
+	if err := writeFakeBareRepo(dir); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := m.Remove(ctx, dir)
+	if err != nil || !removed {
+		t.Fatalf("Remove(existing) = %v, %v; want true, nil", removed, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("dir should be gone after Remove")
+	}
+
+	// Missing dir → idempotent success (a retried prune converges).
+	if removed, err := m.Remove(ctx, dir); err != nil || !removed {
+		t.Fatalf("Remove(missing) = %v, %v; want true, nil", removed, err)
+	}
+
+	// A path outside the mirror root is refused (the rm -rf safety guard).
+	if _, err := m.Remove(ctx, filepath.Join(t.TempDir(), "elsewhere")); err == nil {
+		t.Fatal("Remove of a path outside the root must error")
+	}
+
+	// An in-flight clone for the dir defers removal (removed == false, dir kept).
+	if err := writeFakeBareRepo(dir); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.inflight[filepath.Clean(dir)] = &cloneOp{done: make(chan struct{})}
+	m.mu.Unlock()
+	if removed, err := m.Remove(ctx, dir); err != nil || removed {
+		t.Fatalf("Remove(in-flight) = %v, %v; want false, nil (deferred)", removed, err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal("dir must survive a deferred removal")
+	}
+}
+
 // The core single-flight property: N concurrent first-fetches of the same ref
 // trigger exactly one clone, and all callers get the same mirror.
 func TestEnsurePresent_SingleFlight(t *testing.T) {

@@ -20,6 +20,7 @@ type Mem struct {
 	mu        sync.Mutex
 	repos     map[string]int64 // upstream_url -> id
 	paths     map[int64]string // repo_id -> mirror_path
+	deleted   map[int64]bool   // repo_id -> tombstoned (#24, removal requested)
 	next      int64
 	nextScan  int64
 	events    []core.Access
@@ -99,6 +100,7 @@ func NewMem() *Mem {
 	return &Mem{
 		repos:         make(map[string]int64),
 		paths:         make(map[int64]string),
+		deleted:       make(map[int64]bool),
 		verdicts:      make(map[int64][]memVerdict),
 		findings:      make(map[int64][]memFinding),
 		overrides:     make(map[int64][]memOverride),
@@ -213,10 +215,73 @@ func (m *Mem) ListRepos(_ context.Context) ([]core.RepoInfo, error) {
 	}
 	out := make([]core.RepoInfo, 0, len(m.paths))
 	for id, path := range m.paths {
+		if m.deleted[id] { // tombstoned repos (#24) drop from the list immediately
+			continue
+		}
 		out = append(out, core.RepoInfo{ID: id, UpstreamURL: upstream[id], MirrorPath: path})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+// --- #24: repo removal (transient tombstone) ---
+
+// LookupRepo resolves a repo by URL for the gate's pre-ensure tombstone check.
+func (m *Mem) LookupRepo(_ context.Context, upstreamURL string) (id int64, deleted bool, found bool, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, found = m.repos[upstreamURL]
+	if !found {
+		return 0, false, false, nil
+	}
+	return id, m.deleted[id], true, nil
+}
+
+// MarkRepoDeleted records removal intent (web writes; reconciler prunes).
+func (m *Mem) MarkRepoDeleted(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.paths[id]; ok {
+		m.deleted[id] = true
+	}
+	return nil
+}
+
+// DeletedRepos lists tombstoned repos awaiting prune by the reconciler.
+func (m *Mem) DeletedRepos(_ context.Context) ([]core.RepoInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	upstream := make(map[int64]string, len(m.repos))
+	for url, id := range m.repos {
+		upstream[id] = url
+	}
+	var out []core.RepoInfo
+	for id := range m.deleted {
+		if path, ok := m.paths[id]; ok {
+			out = append(out, core.RepoInfo{ID: id, UpstreamURL: upstream[id], MirrorPath: path})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// DeleteRepo hard-deletes a repo and its children (mem cascade mirrors the FK).
+func (m *Mem) DeleteRepo(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for url, rid := range m.repos {
+		if rid == id {
+			delete(m.repos, url)
+			break
+		}
+	}
+	delete(m.paths, id)
+	delete(m.deleted, id)
+	delete(m.verdicts, id)
+	delete(m.findings, id)
+	delete(m.overrides, id)
+	delete(m.blocks, id)
+	return nil
 }
 
 func (m *Mem) RepoByID(_ context.Context, id int64) (core.RepoInfo, bool, error) {

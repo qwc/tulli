@@ -223,6 +223,42 @@ func getDetail(t *testing.T, ts *httptest.Server, id int64, token string) struct
 	return out
 }
 
+// TestAPI_DeleteRepoAdminOnly covers #24 removal via the API: viewers/reviewers
+// are forbidden, admin marks the repo tombstoned (drops from the list), and a
+// missing repo is a 404.
+func TestAPI_DeleteRepoAdminOnly(t *testing.T) {
+	ts, mem := newAPI(t)
+	ctx := context.Background()
+	id, _ := mem.UpsertRepo(ctx, "https://h/o/r", "/m/r.git")
+
+	_, viewerTok := mkUser(t, ts, "vic", "viewer", "human")
+	_, revTok := mkUser(t, ts, "rae", "reviewer", "human")
+	for _, tok := range []string{viewerTok, revTok} {
+		if code, _ := req(t, ts, "DELETE", fmt.Sprintf("/api/repos/%d", id), tok, nil); code != http.StatusForbidden {
+			t.Errorf("non-admin delete = %d, want 403", code)
+		}
+	}
+	// Still present after the forbidden attempts.
+	if repos, _ := mem.ListRepos(ctx); len(repos) != 1 {
+		t.Fatalf("repo list = %v, want 1 before admin delete", repos)
+	}
+
+	// Admin marks it removed.
+	if code, body := req(t, ts, "DELETE", fmt.Sprintf("/api/repos/%d", id), adminTok, nil); code != http.StatusAccepted {
+		t.Fatalf("admin delete = %d %s, want 202", code, body)
+	}
+	if repos, _ := mem.ListRepos(ctx); len(repos) != 0 {
+		t.Fatalf("repo list = %v, want empty after tombstone", repos)
+	}
+	if dels, _ := mem.DeletedRepos(ctx); len(dels) != 1 {
+		t.Fatalf("DeletedRepos = %v, want the tombstoned repo awaiting prune", dels)
+	}
+	// Deleting a non-existent repo is a 404.
+	if code, _ := req(t, ts, "DELETE", "/api/repos/9999", adminTok, nil); code != http.StatusNotFound {
+		t.Errorf("delete missing repo = %d, want 404", code)
+	}
+}
+
 func TestAPI_AdminCreateUserValidation(t *testing.T) {
 	ts, _ := newAPI(t)
 	// A non-admin cannot create users.
