@@ -1,7 +1,7 @@
 {{define "content"}}
 {{$edit := .Data.CanEdit}}
 <p><a href="/">&larr; all repos</a></p>
-<h1 class="mono">{{.Data.UpstreamURL}}</h1>
+<h1 class="mono"><a href="{{.Data.UpstreamURL}}" target="_blank" rel="noopener noreferrer">{{.Data.UpstreamURL}}</a></h1>
 
 {{if .Data.Error}}<div class="banner err">{{.Data.Error}}</div>{{end}}
 

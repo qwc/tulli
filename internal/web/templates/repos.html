@@ -6,7 +6,10 @@
   <tbody>
   {{range .Data.Repos}}
     <tr>
-      <td><a class="mono" href="/repos/{{.ID}}">{{.UpstreamURL}}</a></td>
+      <td>
+        <a class="mono" href="/repos/{{.ID}}">{{.UpstreamURL}}</a>
+        <a class="muted" href="{{.UpstreamURL}}" target="_blank" rel="noopener noreferrer" title="open upstream repository">origin&nbsp;&#8599;</a>
+      </td>
       <td>
         {{if .Blocked}}
           <span class="badge bad">QUARANTINED</span>
