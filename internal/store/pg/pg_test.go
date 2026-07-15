@@ -201,6 +201,16 @@ func TestPG_ScanFindingsAndRecompute(t *testing.T) {
 	if d, err := s.CurrentDecision(ctx, id, "refs/heads/evil"); err != nil || d != verdict.DecisionClean {
 		t.Fatalf("after override decision = %q, %v, want CLEAN", d, err)
 	}
+
+	// The waiver carries its reason + actor for the UI (#21).
+	ovs, err := s.OverridesForRepo(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ovs) != 1 || ovs[0].Fingerprint != "fp1" || ovs[0].Ref != "refs/heads/evil" ||
+		ovs[0].Reason != "false positive" || ovs[0].Actor != "itsec" {
+		t.Fatalf("OverridesForRepo = %+v, want fp1/evil/false positive/itsec", ovs)
+	}
 }
 
 // TestPG_AuthLookups exercises stage-6a identity on real Postgres: a user with a

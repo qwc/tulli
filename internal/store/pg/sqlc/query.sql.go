@@ -592,6 +592,44 @@ func (q *Queries) OverriddenFingerprints(ctx context.Context, arg OverriddenFing
 	return items, nil
 }
 
+const overridesForRepo = `-- name: OverridesForRepo :many
+SELECT ref, fingerprint, reason, actor FROM overrides WHERE repo_id = $1
+`
+
+type OverridesForRepoRow struct {
+	Ref         *string
+	Fingerprint string
+	Reason      string
+	Actor       string
+}
+
+// Every recorded waiver for a repo (all refs), with reason + actor, so the UI
+// can annotate findings as waived (#21).
+func (q *Queries) OverridesForRepo(ctx context.Context, repoID int64) ([]OverridesForRepoRow, error) {
+	rows, err := q.db.Query(ctx, overridesForRepo, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []OverridesForRepoRow
+	for rows.Next() {
+		var i OverridesForRepoRow
+		if err := rows.Scan(
+			&i.Ref,
+			&i.Fingerprint,
+			&i.Reason,
+			&i.Actor,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recipientsForRepo = `-- name: RecipientsForRepo :many
 SELECT DISTINCT a.user_id, u.name
 FROM access_events a JOIN users u ON u.id = a.user_id

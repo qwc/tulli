@@ -157,6 +157,11 @@ SELECT DISTINCT ref FROM findings WHERE repo_id = $1 AND ref IS NOT NULL;
 -- Overrides apply repo-wide (ref IS NULL) or to a specific ref (spec §6.7 scope).
 SELECT fingerprint FROM overrides WHERE repo_id = $1 AND (ref IS NULL OR ref = $2);
 
+-- name: OverridesForRepo :many
+-- Every recorded waiver for a repo (all refs), with reason + actor, so the UI
+-- can annotate findings as waived (#21).
+SELECT ref, fingerprint, reason, actor FROM overrides WHERE repo_id = $1;
+
 -- name: InsertOverride :exec
 INSERT INTO overrides (repo_id, ref, fingerprint, reason, actor)
 VALUES ($1, sqlc.narg('ref'), $2, $3, $4);

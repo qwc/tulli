@@ -13,6 +13,7 @@ import (
 
 	"codeberg.org/qwc/tulli/internal/auth"
 	"codeberg.org/qwc/tulli/internal/store"
+	"codeberg.org/qwc/tulli/internal/verdict"
 	"codeberg.org/qwc/tulli/internal/web"
 )
 
@@ -158,6 +159,68 @@ func TestAPI_OverrideWritesIntent(t *testing.T) {
 	if err != nil || len(fps) != 1 || fps[0] != "fp-1" {
 		t.Fatalf("OverriddenFingerprints = %v, %v, want [fp-1]", fps, err)
 	}
+}
+
+// TestAPI_OverrideMarksFindingWaived is the #21 regression: after a finding is
+// overridden, the repo detail must report it as waived and carry the reason +
+// actor (previously the override was invisible in the findings list).
+func TestAPI_OverrideMarksFindingWaived(t *testing.T) {
+	ts, mem := newAPI(t)
+	ctx := context.Background()
+	id, _ := mem.UpsertRepo(ctx, "https://h/o/r", "/m/r.git")
+	scanID, err := mem.InsertScan(ctx, id, "gitleaks", "refs/heads/evil", "state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.InsertFinding(ctx, scanID, id, "refs/heads/evil", verdict.Finding{
+		Scanner: "gitleaks", Severity: "HIGH", RuleID: "aws-access-token",
+		FilePath: "config.py", Commit: "deadbeef", Fingerprint: "fp-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, revTok := mkUser(t, ts, "rae", "reviewer", "human")
+
+	// Before the waiver, the finding shows as not waived.
+	detail := getDetail(t, ts, id, revTok)
+	if len(detail.Findings) != 1 || detail.Findings[0].Waived {
+		t.Fatalf("pre-waiver findings = %+v, want one non-waived", detail.Findings)
+	}
+
+	code, body := req(t, ts, "POST", fmt.Sprintf("/api/repos/%d/overrides", id), revTok,
+		map[string]any{"ref": "refs/heads/evil", "fingerprint": "fp-1", "reason": "revoked key"})
+	if code != http.StatusAccepted {
+		t.Fatalf("override = %d %s, want 202", code, body)
+	}
+
+	detail = getDetail(t, ts, id, revTok)
+	if len(detail.Findings) != 1 {
+		t.Fatalf("post-waiver findings = %+v, want one", detail.Findings)
+	}
+	f := detail.Findings[0]
+	if !f.Waived || f.WaiverReason != "revoked key" || f.WaivedBy != "rae" {
+		t.Fatalf("finding = %+v, want waived with reason 'revoked key' by rae", f)
+	}
+}
+
+type findingJSON struct {
+	Waived       bool   `json:"waived"`
+	WaiverReason string `json:"waiver_reason"`
+	WaivedBy     string `json:"waived_by"`
+}
+
+func getDetail(t *testing.T, ts *httptest.Server, id int64, token string) struct {
+	Findings []findingJSON `json:"findings"`
+} {
+	t.Helper()
+	code, body := req(t, ts, "GET", fmt.Sprintf("/api/repos/%d", id), token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("get repo = %d %s", code, body)
+	}
+	var out struct {
+		Findings []findingJSON `json:"findings"`
+	}
+	mustJSON(t, body, &out)
+	return out
 }
 
 func TestAPI_AdminCreateUserValidation(t *testing.T) {

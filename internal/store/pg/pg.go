@@ -193,6 +193,20 @@ func (s *Store) OverriddenFingerprints(ctx context.Context, repoID int64, ref st
 	return s.q.OverriddenFingerprints(ctx, sqlc.OverriddenFingerprintsParams{RepoID: repoID, Ref: ptr(ref)})
 }
 
+// OverridesForRepo returns every recorded waiver for a repo (all refs), with the
+// human reason and actor, so the UI can annotate findings as waived (#21).
+func (s *Store) OverridesForRepo(ctx context.Context, repoID int64) ([]core.Override, error) {
+	rows, err := s.q.OverridesForRepo(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.Override, len(rows))
+	for i, r := range rows {
+		out[i] = core.Override{Ref: str(r.Ref), Fingerprint: r.Fingerprint, Reason: r.Reason, Actor: r.Actor}
+	}
+	return out, nil
+}
+
 func (s *Store) InsertOverride(ctx context.Context, repoID int64, ref, fingerprint, reason, actor string) error {
 	return s.q.InsertOverride(ctx, sqlc.InsertOverrideParams{
 		RepoID: repoID, Ref: ptr(ref), Fingerprint: fingerprint, Reason: reason, Actor: actor,

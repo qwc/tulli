@@ -46,6 +46,8 @@ type Store interface {
 	ResolveVerdict(ctx context.Context, repoID int64) (core.Verdict, error)
 	AffectedRefs(ctx context.Context, repoID int64) ([]string, error)
 	FindingsForRef(ctx context.Context, repoID int64, ref string) ([]verdict.Finding, error)
+	// OverridesForRepo backs the "waived" annotation on findings (#21).
+	OverridesForRepo(ctx context.Context, repoID int64) ([]core.Override, error)
 	InsertManualBlock(ctx context.Context, repoID int64, ref string, active bool, reason, actor string) error
 	InsertOverride(ctx context.Context, repoID int64, ref, fingerprint, reason, actor string) error
 	InsertUser(ctx context.Context, name string, role auth.Role, kind auth.Kind) (int64, error)
@@ -264,6 +266,10 @@ type findingView struct {
 	FilePath    string `json:"file_path"`
 	Commit      string `json:"commit"`
 	Fingerprint string `json:"fingerprint"`
+	// Waived + WaiverReason/WaivedBy are set when an override covers this finding (#21).
+	Waived       bool   `json:"waived"`
+	WaiverReason string `json:"waiver_reason,omitempty"`
+	WaivedBy     string `json:"waived_by,omitempty"`
 }
 
 // vulnView is one CVE match on the repo page — informational, never gating.
@@ -314,6 +320,10 @@ func (s *Server) buildRepoDetail(ctx context.Context, id int64) (repoDetail, err
 	if err != nil {
 		return repoDetail{}, err
 	}
+	overrides, err := s.store.OverridesForRepo(ctx, id)
+	if err != nil {
+		return repoDetail{}, err
+	}
 	var findings []findingView
 	for _, ref := range refs {
 		fs, err := s.store.FindingsForRef(ctx, id, ref)
@@ -321,10 +331,19 @@ func (s *Server) buildRepoDetail(ctx context.Context, id int64) (repoDetail, err
 			return repoDetail{}, err
 		}
 		for _, f := range fs {
-			findings = append(findings, findingView{
+			fv := findingView{
 				Ref: ref, Scanner: f.Scanner, Severity: f.Severity, RuleID: f.RuleID,
 				FilePath: f.FilePath, Commit: f.Commit, Fingerprint: f.Fingerprint,
-			})
+			}
+			// A waiver covers this finding if its fingerprint matches and the
+			// override is repo-wide (ref "") or scoped to this ref (spec §6.7).
+			for _, o := range overrides {
+				if o.Fingerprint == f.Fingerprint && (o.Ref == "" || o.Ref == ref) {
+					fv.Waived, fv.WaiverReason, fv.WaivedBy = true, o.Reason, o.Actor
+					break
+				}
+			}
+			findings = append(findings, fv)
 		}
 	}
 	vms, err := s.store.VulnMatchesForRepo(ctx, id)

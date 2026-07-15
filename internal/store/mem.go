@@ -83,6 +83,8 @@ type memFinding struct {
 type memOverride struct {
 	ref         string // "" = repo-wide
 	fingerprint string
+	reason      string
+	actor       string
 }
 
 // memManualBlock mirrors a manual_blocks row (verdict-provenance Option B). ref
@@ -287,11 +289,23 @@ func (m *Mem) OverriddenFingerprints(_ context.Context, repoID int64, ref string
 	return out, nil
 }
 
-func (m *Mem) InsertOverride(_ context.Context, repoID int64, ref, fingerprint, _, _ string) error {
+func (m *Mem) InsertOverride(_ context.Context, repoID int64, ref, fingerprint, reason, actor string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.overrides[repoID] = append(m.overrides[repoID], memOverride{ref: ref, fingerprint: fingerprint})
+	m.overrides[repoID] = append(m.overrides[repoID], memOverride{ref: ref, fingerprint: fingerprint, reason: reason, actor: actor})
 	return nil
+}
+
+// OverridesForRepo returns every recorded waiver for a repo (all refs), with the
+// human reason and actor, so the UI can annotate findings as waived (#21).
+func (m *Mem) OverridesForRepo(_ context.Context, repoID int64) ([]core.Override, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]core.Override, 0, len(m.overrides[repoID]))
+	for _, o := range m.overrides[repoID] {
+		out = append(out, core.Override{Ref: o.ref, Fingerprint: o.fingerprint, Reason: o.reason, Actor: o.actor})
+	}
+	return out, nil
 }
 
 // InsertManualBlock records a human block/lift (verdict-provenance Option B),

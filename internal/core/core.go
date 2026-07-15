@@ -60,6 +60,16 @@ type VulnMatch struct {
 	TriageStatus string
 }
 
+// Override is the read model for a recorded finding waiver (VEX, spec §6.7): a
+// fingerprint that has been overridden repo-wide (Ref == "") or for a specific
+// ref, with the human reason and actor. Used to annotate findings as waived.
+type Override struct {
+	Ref         string // "" = repo-wide
+	Fingerprint string
+	Reason      string
+	Actor       string
+}
+
 // TriageItem is one PENDING triage row for the queue view (§6d): a CVE match
 // awaiting a human decision, with enough context to act on and to block.
 type TriageItem struct {

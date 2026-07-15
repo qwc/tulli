@@ -23,24 +23,34 @@
 <h2>Findings</h2>
 {{if .Data.Findings}}
 <table>
-  <thead><tr><th>Ref</th><th>Scanner</th><th>Severity</th><th>Rule</th><th>File</th><th>Commit</th>{{if $edit}}<th>Waive</th>{{end}}</tr></thead>
+  <thead><tr><th>Ref</th><th>Scanner</th><th>Severity</th><th>Rule</th><th>File</th><th>Commit</th><th>Waiver</th>{{if $edit}}<th>Action</th>{{end}}</tr></thead>
   <tbody>
   {{range .Data.Findings}}
     <tr>
       <td class="mono">{{if .Ref}}{{.Ref}}{{else}}(repo-wide){{end}}</td>
       <td>{{.Scanner}}</td>
-      <td>{{if eq .Severity "HIGH"}}<span class="badge bad">{{.Severity}}</span>{{else}}{{.Severity}}{{end}}</td>
+      <td>{{if .Waived}}<span class="muted">{{.Severity}}</span>{{else if eq .Severity "HIGH"}}<span class="badge bad">{{.Severity}}</span>{{else}}{{.Severity}}{{end}}</td>
       <td class="mono">{{.RuleID}}</td>
       <td class="mono">{{.FilePath}}</td>
       <td class="mono">{{short .Commit}}</td>
+      <td>
+        {{if .Waived}}
+          <span class="badge role">WAIVED</span>
+          <span class="muted">{{.WaiverReason}}{{if .WaivedBy}} &mdash; {{.WaivedBy}}{{end}}</span>
+        {{else}}&mdash;{{end}}
+      </td>
       {{if $edit}}
       <td>
+        {{if .Waived}}
+          <span class="muted">waived</span>
+        {{else}}
         <form method="post" action="/repos/{{$.Data.ID}}/overrides">
           <input type="hidden" name="ref" value="{{.Ref}}">
           <input type="hidden" name="fingerprint" value="{{.Fingerprint}}">
           <input type="text" name="reason" placeholder="waiver reason" required>
           <button type="submit">Override</button>
         </form>
+        {{end}}
       </td>
       {{end}}
     </tr>
