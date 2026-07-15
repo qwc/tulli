@@ -11,7 +11,10 @@ COPY certs/ /usr/local/share/ca-certificates/tulli/
 RUN update-ca-certificates
 COPY . .
 # vendor/ is present, so the build is fully offline and reproducible.
-RUN CGO_ENABLED=0 go build -mod=vendor -o /out/tulli ./cmd/tulli
+# tullictl is the bearer-token admin/inspection client (e.g. `tullictl repos`);
+# ship it alongside the server so `docker compose exec tulli tullictl …` works.
+RUN CGO_ENABLED=0 go build -mod=vendor -o /out/tulli ./cmd/tulli \
+ && CGO_ENABLED=0 go build -mod=vendor -o /out/tullictl ./cmd/tullictl
 
 # --- runtime: the git server needs the real git (for git-http-backend, clone,
 #     config, for-each-ref) plus gitleaks (fast lane, secrets) and trivy (deep
@@ -76,6 +79,7 @@ RUN git config --system --add safe.directory '*'
 # the tulli-owned cache dir.
 RUN useradd -r -u 10001 -m -d /home/tulli tulli && mkdir -p /data && chown tulli /data && chown -R tulli /opt/trivy-cache
 COPY --from=build /out/tulli /usr/local/bin/tulli
+COPY --from=build /out/tullictl /usr/local/bin/tullictl
 
 USER tulli
 ENV TULLI_ADDR=:8080 TULLI_DATA=/data
