@@ -1,5 +1,7 @@
 # tulli
 
+[![CI](https://git.mmo.to/qwc-open/tulli/actions/workflows/ci.yml/badge.svg)](https://git.mmo.to/qwc-open/tulli/actions?workflow=ci.yml)
+
 A caching git proxy for public open-source repos that **mirrors, continuously
 scans, and quarantines** external FOSS code — a customs house for everything your
 builds pull from the WWW. (`tulli` is Finnish for *customs*.)
@@ -155,6 +157,23 @@ go test -short ./...     # skip the network (real GitHub) integration test
 - **Postgres (`internal/store/pg`):** boots embedded-postgres, applies the schema,
   and runs the store's queries against a real PG. Skipped in `-short`; needs a
   writable `$HOME` (download cache) and network on first run.
+
+## CI/CD
+
+Forgejo Actions workflows live in [`.forgejo/workflows/`](.forgejo/workflows):
+
+- **`ci.yml`** (push to main + every PR) — `gofmt` gate, `go vet`, `go build`,
+  and the full `go test -race ./...` with gitleaks installed and
+  embedded-postgres running, so the secret-scan and real-PG integration tests
+  execute rather than skip. On PRs it also `docker build`s the image to prove the
+  Dockerfile.
+- **`release.yml`** (push to main + `v*` tags) — builds and pushes the container
+  image to the Forgejo registry (`git.mmo.to/qwc-open/tulli`): `:latest` +
+  `:main-<sha>` on main, `:<version>` + `:latest` on a tag.
+
+Images build with **buildah** (daemonless, `--storage-driver vfs`), so no Docker
+socket or privileged runner is required. `runs-on: ubuntu-latest` must match a
+label your Forgejo runner advertises.
 
 ## Layout
 

@@ -1,0 +1,50 @@
+# Forgejo Actions CD — build the container image (daemonless, with buildah) and
+# push it to the Forgejo container registry. Runs on pushes to main (→ :latest +
+# :main-<sha>) and on version tags (v1.2.3 → :1.2.3 + :latest).
+#
+# Auth uses the automatic per-run token (secrets.GITHUB_TOKEN); the repo must
+# allow the Actions token to write packages. If package push is denied, create a
+# repo secret with a PAT that has package:write and swap it in below.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  IMAGE: git.mmo.to/qwc-open/tulli
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install buildah
+        run: sudo apt-get update && sudo apt-get install -y buildah
+
+      - name: compute tags
+        id: tags
+        run: |
+          case "${{ github.ref }}" in
+            refs/tags/*)
+              version="${{ github.ref_name }}"; version="${version#v}"
+              tags="$IMAGE:$version $IMAGE:latest"
+              ;;
+            *)
+              short=$(echo "${{ github.sha }}" | cut -c1-12)
+              tags="$IMAGE:latest $IMAGE:main-$short"
+              ;;
+          esac
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: login to the Forgejo registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | buildah login -u "${{ github.actor }}" --password-stdin git.mmo.to
+
+      - name: build & push
+        run: |
+          build_args=""
+          for t in ${{ steps.tags.outputs.tags }}; do build_args="$build_args -t $t"; done
+          buildah bud --storage-driver vfs $build_args .
+          for t in ${{ steps.tags.outputs.tags }}; do buildah push --storage-driver vfs "$t"; done
